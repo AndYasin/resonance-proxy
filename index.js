@@ -123,19 +123,23 @@ let trendingCache = { items: [], fetchedAt: 0 };
 
 async function fetchTrending() {
   const now = new Date();
+  // Use yesterday and day-before-yesterday (today's data not ready until end of day)
   const yesterday = new Date(now - 86400000);
+  const dayBefore = new Date(now - 172800000);
   const fmt = d => ({
     year: d.getFullYear(),
     month: String(d.getMonth()+1).padStart(2,'0'),
     day: String(d.getDate()).padStart(2,'0')
   });
-  const td = fmt(now);
-  const yd = fmt(yesterday);
+  const td = fmt(yesterday);   // "today" = yesterday
+  const yd = fmt(dayBefore);   // "yesterday" = day before
 
   function getTop(d) {
     return new Promise((resolve) => {
+      // Try both 'all-days' and specific date
       const path = '/api/rest_v1/metrics/pageviews/top/en.wikipedia/all-access/' +
         d.year + '/' + d.month + '/' + d.day;
+      console.log('Fetching top:', path);
       https.get({
         hostname: 'wikimedia.org', path,
         headers: { 'User-Agent': 'ResonanceBot/1.0' }
@@ -147,12 +151,14 @@ async function fetchTrending() {
             resolve(items);
           } catch(e) { resolve([]); }
         });
-      }).on('error', () => resolve([]));
+      }).on('error', (e) => { console.log('getTop error:', e.message); resolve([]); });
     });
   }
 
   try {
+    console.log('Fetching trending for', td.year+'-'+td.month+'-'+td.day, 'vs', yd.year+'-'+yd.month+'-'+yd.day);
     const [todayTop, yestTop] = await Promise.all([getTop(td), getTop(yd)]);
+    console.log('Got', todayTop.length, 'today articles,', yestTop.length, 'yesterday articles');
     const yestMap = {};
     yestTop.forEach(a => { yestMap[a.article] = a.views; });
 
