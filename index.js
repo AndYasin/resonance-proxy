@@ -36,8 +36,16 @@ const server = http.createServer((req, res) => {
                 const data = JSON.parse(line.slice(6));
                 if ((data.type === 'edit' || data.type === 'new') &&
                     allowedWikis.includes(data.wiki) &&
+                    data.title &&
                     !data.title.includes(':')) {
-                  res.write(`data: ${JSON.stringify(data)}\n\n`);
+                  res.write(`data: ${JSON.stringify({
+                    title: data.title,
+                    wiki: data.wiki,
+                    user: data.user,
+                    bot: data.bot,
+                    type: data.type,
+                    timestamp: data.timestamp
+                  })}\n\n`);
                 }
               } catch(e) {}
             }
