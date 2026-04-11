@@ -312,6 +312,28 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // /github endpoint
+  if (req.url === '/github') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      trending: githubEventCache.trending || [],
+      events: githubEventCache.events || [],
+      fetchedAt: githubEventCache.fetchedAt || 0
+    }));
+    return;
+  }
+
+  // /binance endpoint
+  if (req.url === '/binance') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      items: binanceStatsCache.items || [],
+      fetchedAt: binanceStatsCache.fetchedAt || 0,
+      signals: findCrossSignals()
+    }));
+    return;
+  }
+
   // SSE stream
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
@@ -365,7 +387,8 @@ server.listen(process.env.PORT || 3000, '0.0.0.0', () => {
   console.log('TG thresholds — Tier1: 4+ editors | Tier2: 5+ editors | Tier3: 6+ editors');
   if (TELEGRAM_TOKEN) {
     sendTelegram(
-      '🟢 <b>Resonance v4 запущено</b>\n\n' +
+      '🟢 <b>Resonance v5 запущено</b>\n\n' +
+      '📡 Wikipedia + GitHub + Binance\n' +
       '📡 Мов: ' + ALL_WIKIS.size + ' (en/de/fr/es/ru/ja/zh + ar/fa/ta/hi + 19 інших)\n\n' +
       '⚙️ Пороги Telegram:\n' +
       '🔵 Tier 1 (en/de/fr/es...): 4+ редактори / 5 хв\n' +
@@ -375,3 +398,231 @@ server.listen(process.env.PORT || 3000, '0.0.0.0', () => {
     );
   }
 });
+
+// ════════════════════════════════════════
+// GITHUB EVENTS — зірочки і форки
+// ════════════════════════════════════════
+
+const githubCache = { items: [], fetchedAt: 0 };
+const githubStars = {}; // repo -> {stars, prev, delta, fetchedAt}
+
+async function fetchGithubTrending() {
+  return new Promise((resolve) => {
+    // GitHub public events - no auth needed, 60 req/hour
+    const path = '/repos?q=stars:>100&sort=stars&order=desc&per_page=50&type=repositories';
+    // Use search API for trending
+    const searchPath = '/search/repositories?q=stars:>50+pushed:>' + getRecentDate(1) + '&sort=stars&order=desc&per_page=50';
+
+    https.get({
+      hostname: 'api.github.com',
+      path: searchPath,
+      headers: {
+        'User-Agent': 'ResonanceBot/1.0',
+        'Accept': 'application/vnd.github.v3+json'
+      }
+    }, (res) => {
+      let data = ''; res.on('data', c => data += c);
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(data);
+          const items = (json.items || []).map(r => ({
+            name: r.full_name,
+            desc: (r.description || '').slice(0, 80),
+            stars: r.stargazers_count,
+            forks: r.forks_count,
+            lang: r.language || '',
+            topics: (r.topics || []).slice(0, 3),
+            url: r.html_url,
+            pushed: r.pushed_at
+          }));
+          githubCache.items = items;
+          githubCache.fetchedAt = Date.now();
+          console.log('GitHub updated:', items.length, 'repos, top:', items[0]?.name);
+          resolve(items);
+        } catch(e) {
+          console.log('GitHub parse error:', e.message);
+          resolve([]);
+        }
+      });
+    }).on('error', e => { console.log('GitHub fetch error:', e.message); resolve([]); });
+  });
+}
+
+// Get events to track star velocity
+const starVelocity = {}; // repo -> [{t, stars}]
+
+async function fetchGithubEvents() {
+  return new Promise((resolve) => {
+    https.get({
+      hostname: 'api.github.com',
+      path: '/events?per_page=100',
+      headers: { 'User-Agent': 'ResonanceBot/1.0', 'Accept': 'application/vnd.github.v3+json' }
+    }, (res) => {
+      let data = ''; res.on('data', c => data += c);
+      res.on('end', () => {
+        try {
+          const events = JSON.parse(data);
+          const now = Date.now();
+          const spikes = {};
+
+          events.forEach(ev => {
+            if (ev.type === 'WatchEvent' || ev.type === 'ForkEvent') {
+              const repo = ev.repo.name;
+              if (!spikes[repo]) spikes[repo] = { watches: 0, forks: 0, url: 'https://github.com/' + repo };
+              if (ev.type === 'WatchEvent') spikes[repo].watches++;
+              if (ev.type === 'ForkEvent') spikes[repo].forks++;
+            }
+          });
+
+          // Find repos with 3+ stars in this batch
+          const hot = Object.entries(spikes)
+            .filter(([, v]) => v.watches >= 2 || v.forks >= 2)
+            .sort((a, b) => (b[1].watches + b[1].forks) - (a[1].watches + a[1].forks))
+            .slice(0, 20)
+            .map(([name, v]) => ({ name, ...v, score: v.watches * 2 + v.forks }));
+
+          resolve(hot);
+        } catch(e) { resolve([]); }
+      });
+    }).on('error', () => resolve([]));
+  });
+}
+
+function getRecentDate(daysAgo) {
+  const d = new Date(Date.now() - daysAgo * 86400000);
+  return d.toISOString().split('T')[0];
+}
+
+// GitHub event stream cache
+let githubEventCache = { items: [], fetchedAt: 0 };
+
+async function pollGithub() {
+  try {
+    const [trending, events] = await Promise.all([
+      fetchGithubTrending(),
+      fetchGithubEvents()
+    ]);
+    githubEventCache = { trending, events, fetchedAt: Date.now() };
+  } catch(e) {
+    console.log('GitHub poll error:', e.message);
+  }
+}
+
+pollGithub();
+setInterval(pollGithub, 120000); // every 2 min (stay under rate limit)
+
+
+// ════════════════════════════════════════
+// BINANCE — об'єми торгів
+// ════════════════════════════════════════
+
+let binanceWs = null;
+const binanceData = {}; // symbol -> {price, vol1m, vol5m, trades1m, anomaly}
+const binanceSubs = ['btcusdt', 'ethusdt', 'bnbusdt', 'solusdt', 'xrpusdt',
+                     'adausdt', 'dogeusdt', 'avaxusdt', 'maticusdt', 'linkusdt',
+                     'dotusdt', 'uniusdt', 'atomusdt', 'ltcusdt', 'nearusdt'];
+
+function connectBinance() {
+  const streams = binanceSubs.map(s => s + '@aggTrade').join('/');
+  const WS_URL = 'wss://stream.binance.com:9443/stream?streams=' + streams;
+
+  try {
+    // Use https to get initial data, then use polling (WebSocket needs ws module)
+    // Fetch 24hr stats via REST as fallback
+    fetchBinanceStats();
+  } catch(e) {
+    console.log('Binance init error:', e.message);
+  }
+}
+
+let binanceStatsCache = { items: [], fetchedAt: 0 };
+
+async function fetchBinanceStats() {
+  return new Promise((resolve) => {
+    const symbols = binanceSubs.map(s => s.toUpperCase());
+    const query = '?symbols=' + encodeURIComponent(JSON.stringify(symbols));
+
+    https.get({
+      hostname: 'api.binance.com',
+      path: '/api/v3/ticker/24hr' + query,
+      headers: { 'User-Agent': 'ResonanceBot/1.0' }
+    }, (res) => {
+      let data = ''; res.on('data', c => data += c);
+      res.on('end', () => {
+        try {
+          const tickers = JSON.parse(data);
+          const now = Date.now();
+
+          const items = tickers.map(t => {
+            const sym = t.symbol;
+            const price = parseFloat(t.lastPrice);
+            const change = parseFloat(t.priceChangePercent);
+            const vol = parseFloat(t.quoteVolume); // USDT volume
+            const trades = parseInt(t.count);
+
+            // Store history for anomaly detection
+            if (!binanceData[sym]) binanceData[sym] = { history: [] };
+            binanceData[sym].history.push({ vol, price, t: now });
+            binanceData[sym].history = binanceData[sym].history.filter(h => now - h.t < 3600000);
+
+            // Calculate volume anomaly
+            const hist = binanceData[sym].history;
+            const avgVol = hist.length > 1
+              ? hist.slice(0, -1).reduce((s, h) => s + h.vol, 0) / (hist.length - 1)
+              : vol;
+            const volRatio = avgVol > 0 ? vol / avgVol : 1;
+
+            return {
+              symbol: sym,
+              price,
+              change,
+              vol: Math.round(vol),
+              trades,
+              volRatio: +volRatio.toFixed(2),
+              isAnomaly: Math.abs(change) >= 3 || volRatio >= 2
+            };
+          })
+          .sort((a, b) => Math.abs(b.change) - Math.abs(a.change));
+
+          binanceStatsCache = { items, fetchedAt: now };
+          console.log('Binance updated:', items.length, 'pairs, top mover:', items[0]?.symbol, items[0]?.change + '%');
+          resolve(items);
+        } catch(e) {
+          console.log('Binance parse error:', e.message, data.slice(0, 100));
+          resolve([]);
+        }
+      });
+    }).on('error', e => { console.log('Binance fetch error:', e.message); resolve([]); });
+  });
+}
+
+connectBinance();
+setInterval(fetchBinanceStats, 60000); // every minute
+
+
+// ════════════════════════════════════════
+// CROSS-SIGNAL DETECTION
+// ════════════════════════════════════════
+
+function findCrossSignals() {
+  const signals = [];
+  const wikiTitles = Object.keys(anomWindow).map(k => k.split(':').slice(1).join(':').toLowerCase());
+
+  // Check if any Binance anomaly matches Wikipedia topic
+  if (binanceStatsCache.items) {
+    binanceStatsCache.items.filter(t => t.isAnomaly).forEach(ticker => {
+      const sym = ticker.symbol.replace('USDT','').toLowerCase();
+      const wikiMatch = wikiTitles.find(t => t.includes(sym));
+      if (wikiMatch) {
+        signals.push({
+          type: 'WIKI+CRYPTO',
+          title: ticker.symbol + ' & ' + wikiMatch,
+          detail: ticker.change + '% · wiki активна',
+          color: '#64ffda'
+        });
+      }
+    });
+  }
+
+  return signals;
+}
