@@ -4,6 +4,7 @@ const https = require('https');
 const server = http.createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', '*');
 
   if (req.method === 'OPTIONS') {
     res.writeHead(200);
@@ -18,6 +19,8 @@ const server = http.createServer((req, res) => {
     'X-Accel-Buffering': 'no'
   });
 
+  const allowedWikis = ['enwiki','ukwiki','dewiki','frwiki','ruwiki','eswiki','jawiki','plwiki'];
+
   function connectUpstream() {
     const req2 = https.get({
       hostname: 'stream.wikimedia.org',
@@ -25,7 +28,21 @@ const server = http.createServer((req, res) => {
       headers: { 'Accept': 'text/event-stream', 'User-Agent': 'ResonanceProxy/1.0' }
     }, (upstream) => {
       upstream.on('data', chunk => {
-        try { res.write(chunk); } catch(e) { upstream.destroy(); }
+        try {
+          const lines = chunk.toString().split('\n');
+          lines.forEach(line => {
+            if (line.startsWith('data: ')) {
+              try {
+                const data = JSON.parse(line.slice(6));
+                if ((data.type === 'edit' || data.type === 'new') &&
+                    allowedWikis.includes(data.wiki) &&
+                    !data.title.includes(':')) {
+                  res.write(`data: ${JSON.stringify(data)}\n\n`);
+                }
+              } catch(e) {}
+            }
+          });
+        } catch(e) {}
       });
       upstream.on('end', () => setTimeout(connectUpstream, 2000));
       upstream.on('error', () => setTimeout(connectUpstream, 2000));
