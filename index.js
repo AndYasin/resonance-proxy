@@ -251,7 +251,7 @@ async function checkAnomaly(title, wiki, user, isBot) {
   w.ts60  = w.ts60.filter(t => now - t < 60000);
   w.ts300 = w.ts300.filter(t => now - t < 300000);
   if (w.ts60.length === 0) w.users60 = new Set();
-  if (w.ts300.length === 0) { w.users300 = new Set(); w.firedMulti = false; w.firedSingle = false; w.firedSupabase = false; }
+  if (w.ts300.length === 0) { w.users300 = new Set(); w.firedMulti = false; w.firedSingle = false; w.firedSupabase = false; w.firedSingleSupa = false; }
 
   const hits60  = w.ts60.length;
   const uniq60  = w.users60.size;
@@ -262,22 +262,54 @@ async function checkAnomaly(title, wiki, user, isBot) {
   const spikeThreshold = getSpikeThreshold(wiki);
   const alertKey = key + ':' + Math.floor(now / 300000);
 
-  // ── Supabase: записуємо при 2+ редакторах (незалежно від TG) ──
+  // ── Supabase: записуємо при 2+ редакторах з повними даними ──
   if (uniq300 >= 2 && hits300 >= 2 && !w.firedSupabase) {
     w.firedSupabase = true;
-    supabaseInsert('anomalies', {
-      title: title,
-      wiki: wiki,
-      lang: lang,
-      type: 'mul',
-      edits: hits300,
-      editors: uniq300,
-      lang_count: 0,
-      article_type: '',
-      url: 'https://' + lang + '.wikipedia.org/wiki/' + encodeURIComponent(title.replace(/ /g,'_')),
-      score: uniq300 * 3 + hits300,
-      is_trending: false,
-      trend_pct: null
+    const wikiUrl = 'https://' + lang + '.wikipedia.org/wiki/' + encodeURIComponent(title.replace(/ /g,'_'));
+
+    // Збираємо повні дані асинхронно перед записом
+    Promise.all([
+      getWikiInfo(title, lang),
+      getViewsRatio(lang, title)
+    ]).then(([info, pvData]) => {
+      const typeWeights = {'СМЕРТЬ':50,'ГЕОПОЛІТИКА':20,'ПОЛІТИК':18,'ВІЙСЬКОВІ':15,
+        'БІЗНЕС':12,'НАУКА':8,'КУЛЬТУРА':6,'СПОРТ':5,'ФУТБОЛ':4,'ПЕРСОНА':3};
+      const atype = info.type || '';
+      const lc = info.langCount || 0;
+      const pvRatio = pvData ? pvData.ratio : 0;
+      const trendItem = (trendingCache && trendingCache.items) ? trendingCache.items.find(t =>
+        t.article.toLowerCase() === title.toLowerCase()) : null;
+      const trendPct = trendItem ? trendItem.delta : null;
+
+      const typeScore = typeWeights[atype.replace(/[^а-яА-ЯіІїЇєЄa-zA-Z]/g,'')] || 0;
+      const langScore = Math.min(lc * 0.4, 30);
+      const trendScore = trendPct ? Math.min(trendPct / 20, 20) : 0;
+      const pvScore = pvRatio ? Math.min((pvRatio - 1) * 3, 15) : 0;
+      const actScore = uniq300 * 2.5 + hits300 * 0.8;
+      const score = typeScore + langScore + trendScore + pvScore + actScore;
+
+      supabaseInsert('anomalies', {
+        title: title,
+        wiki: wiki,
+        lang: lang,
+        type: uniq300 >= 3 ? 'res' : 'mul',
+        edits: hits300,
+        editors: uniq300,
+        lang_count: lc,
+        article_type: atype,
+        url: wikiUrl,
+        score: Math.round(score),
+        is_trending: trendPct !== null,
+        trend_pct: trendPct
+      });
+    }).catch(() => {
+      // Fallback — записуємо без деталей
+      supabaseInsert('anomalies', {
+        title, wiki, lang, type: 'mul',
+        edits: hits300, editors: uniq300,
+        lang_count: 0, article_type: '', url: wikiUrl,
+        score: uniq300 * 3 + hits300, is_trending: false, trend_pct: null
+      });
     });
   }
 
