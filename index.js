@@ -41,9 +41,38 @@ function getTrends() {
   return Promise.all(geos.map(fetchGeo)).then(results => {
     trendsCache.items = results.flat();
     trendsCache.fetchedAt = Date.now();
+    saveTrendsToSupabase(trendsCache.items);
     return trendsCache.items;
   });
 }
+
+function saveTrendsToSupabase(items) {
+  // Групуємо по title — збираємо всі гео де trending
+  const byTitle = {};
+  items.forEach(item => {
+    const t = item.title;
+    if (!byTitle[t]) byTitle[t] = { title: t, geos: [], geo_count: 0 };
+    byTitle[t].geos.push(item.geo);
+    byTitle[t].geo_count++;
+  });
+  // Пишемо тільки ті що trending в 2+ країнах — це сигнал
+  Object.values(byTitle)
+    .filter(t => t.geo_count >= 2)
+    .sort((a,b) => b.geo_count - a.geo_count)
+    .slice(0, 30)
+    .forEach(t => {
+      supabaseInsert('trends_signals', {
+        title: t.title,
+        geos: t.geos,
+        geo_count: t.geo_count,
+        score: t.geo_count * 15
+      }, 'title');
+    });
+  console.log('Trends saved to Supabase:', Object.values(byTitle).filter(t=>t.geo_count>=2).length, 'multi-geo items');
+}
+
+// Оновлюємо кожні 15 хв
+setInterval(() => { trendsCache.fetchedAt = 0; getTrends(); }, 900000);
 
 function fetchTrendsSignal(title, editors) {
   const words = title.toLowerCase().split(/\s+/).filter(w=>w.length>3);
