@@ -1423,10 +1423,10 @@ async function pollPageviews() {
         sparkline: JSON.stringify(sparkline),
         url: 'https://en.wikipedia.org/wiki/' + encodeURIComponent(title.replace(/ /g,'_')),
         is_trending: trendingCache.items.some(t => t.article === title)
-      });
+      }, 'title,lang');
       inserted++;
 
-      // Якщо дуже різкий спайк — cross_signal
+      // Якщо дуже різкий спайк — cross_signal (upsert по title+type)
       if (ratio >= 5) {
         supabaseInsert('cross_signals', {
           type: 'WIKI+PAGEVIEW',
@@ -1434,8 +1434,8 @@ async function pollPageviews() {
           detail: '×' + ratio.toFixed(1) + ' від норми · ' + lastViews.toLocaleString() + ' переглядів',
           wiki_title: title,
           crypto_symbol: null,
-          score: Math.min(ratio * 10, 100)
-        });
+          score: Math.round(ratio * 8)  // ratio 11 → 88, ratio 20 → 160
+        }, 'title,type');
       }
     }
 
