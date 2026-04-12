@@ -443,7 +443,7 @@ async function checkAnomaly(title, wiki, user, isBot) {
   const now = Date.now();
 
   if (!anomWindow[key]) {
-    anomWindow[key] = { ts60:[], users60:new Set(), ts300:[], users300:new Set(), firedMulti:false, firedSingle:false, lastSeen:now };
+    anomWindow[key] = { ts60:[], users60:new Set(), ts300:[], users300:new Set(), firedMulti:false, firedSingle:false, lastSeen:now, firstSeen:now };
   }
   const w = anomWindow[key];
   w.lastSeen = now;
@@ -496,7 +496,14 @@ async function checkAnomaly(title, wiki, user, isBot) {
         const e = uniq300;
         const editorScore = e<=2?e*2.5:e<=4?5+(e-2)*8:e<=9?21+(e-4)*20:121+(e-10)*40;
         const actScore = editorScore + hits300 * 0.8;
-        const score = typeScore + langScore + trendScore + pvScore + actScore;
+        // span — час активності в хвилинах (з anomWindow)
+        const spanMin = (now - (w.firstSeen || now)) / 60000;
+        const susScore = Math.min(spanMin / 10, 15);
+        // resonanceBonus — якщо є в trending
+        const resonanceBonus = trendPct && uniq300 >= 2 ? 25 : 0;
+        // burst бонус — 5+ редакторів за перші 10 хв
+        const burstBonus = e >= 5 && spanMin <= 10 ? 30 : 0;
+        const score = typeScore + langScore + trendScore + pvScore + actScore + susScore + resonanceBonus + burstBonus;
 
         supabaseInsert('anomalies', {
           title, wiki, lang,
