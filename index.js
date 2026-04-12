@@ -13,6 +13,63 @@ function setCache(key, data) {
   endpointCache[key] = { data, ts: Date.now() };
 }
 
+// ── GOOGLE TRENDS CROSS-SIGNAL ──
+let trendsCache = { items: [], fetchedAt: 0 };
+
+function getTrends() {
+  const now = Date.now();
+  if (now - trendsCache.fetchedAt < 900000 && trendsCache.items.length) {
+    return Promise.resolve(trendsCache.items);
+  }
+  const geos = ['US','GB','DE','UA','IN','FR','BR','JP'];
+  const fetchGeo = (geo) => new Promise((resolve) => {
+    https.get({
+      hostname: 'trends.google.com',
+      path: '/trending/rss?geo='+geo,
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ResonanceBot/1.0)' }
+    }, (r) => {
+      let raw = ''; r.on('data', d => raw += d);
+      r.on('end', () => {
+        try {
+          const re = /<title>(?:<!\[CDATA\[)?(.+?)(?:\]\]>)?<\/title>/g;
+          const titles = [...raw.matchAll(re)].map(m=>m[1].trim()).slice(1,11);
+          resolve(titles.map(t=>({title:t.toLowerCase(),geo})));
+        } catch(e) { resolve([]); }
+      });
+    }).on('error', () => resolve([]));
+  });
+  return Promise.all(geos.map(fetchGeo)).then(results => {
+    trendsCache.items = results.flat();
+    trendsCache.fetchedAt = Date.now();
+    return trendsCache.items;
+  });
+}
+
+function fetchTrendsSignal(title, editors) {
+  const words = title.toLowerCase().split(/\s+/).filter(w=>w.length>3);
+  getTrends().then(trends => {
+    const matches = trends.filter(t => words.some(w => t.title.includes(w)));
+    if (!matches.length) return;
+    const geos = [...new Set(matches.map(m=>m.geo))];
+    console.log('Google Trends match:', title, '| geos:', geos.join(','));
+    supabaseInsert('cross_signals', {
+      type: 'WIKI+TRENDS',
+      title: title,
+      detail: 'trending in: '+geos.join(','),
+      wiki_title: title,
+      crypto_symbol: null,
+      score: geos.length * 15
+    });
+    if (editors >= 2 && geos.length >= 2 && TELEGRAM_TOKEN) {
+      sendTelegram(
+        '📈 <b>Google Trends сигнал: ' + title + '</b>\n\n' +
+        '🌍 Trending в: <b>' + geos.join(', ') + '</b>\n' +
+        '👥 ' + editors + ' редактори на Wikipedia одночасно'
+      );
+    }
+  }).catch(()=>{});
+}
+
 // ── POLYMARKET CROSS-SIGNAL ──
 let polyCache = { items: [], fetchedAt: 0 };
 
@@ -446,7 +503,7 @@ async function checkAnomaly(title, wiki, user, isBot) {
         score: Math.round(score),
         is_trending: trendPct !== null,
         trend_pct: trendPct
-      });
+      }, 'title,wiki');
     }).catch(() => {
       // Fallback — записуємо без деталей
       supabaseInsert('anomalies', {
@@ -454,7 +511,7 @@ async function checkAnomaly(title, wiki, user, isBot) {
         edits: hits300, editors: uniq300,
         lang_count: 0, article_type: '', url: wikiUrl,
         score: uniq300 * 3 + hits300, is_trending: false, trend_pct: null
-      });
+      }, 'title,wiki');
     });
   }
 
@@ -471,6 +528,8 @@ async function checkAnomaly(title, wiki, user, isBot) {
 
     // ── Polymarket cross-signal ──
     fetchPolymarketSignal(title, uniq300);
+    // ── Google Trends cross-signal ──
+    fetchTrendsSignal(title, uniq300);
     // GDELT auto-enrich вимкнено — зберігаємо квоту для AI модалки
 
     // ── Записуємо всі аномалії в Supabase ──
@@ -484,10 +543,10 @@ async function checkAnomaly(title, wiki, user, isBot) {
       lang_count: info.langCount,
       article_type: (info.type || '').replace(/[^a-zA-Zа-яА-ЯіІїЇєЄ\s]/g,'').trim(),
       url: 'https://' + lang + '.wikipedia.org/wiki/' + encodeURIComponent(title.replace(/ /g,'_')),
-      score: (editors300 || editors60) * 3 + (hits300 || hits60),
+      score: uniq300 * 3 + hits300,
       is_trending: info.langCount >= 50,
       trend_pct: null
-    });
+    }, 'title,wiki');
 
     // Strict importance filter for Telegram
     const isImportant =
@@ -685,7 +744,7 @@ const server = http.createServer((req, res) => {
       { name: 'BBC World', url: 'https://feeds.bbci.co.uk/news/world/rss.xml' },
       { name: 'Al Jazeera', url: 'https://www.aljazeera.com/xml/rss/all.xml' },
       { name: 'Reuters', url: 'https://feeds.reuters.com/reuters/worldNews' },
-      { name: 'AP News', url: 'https://rsshub.app/apnews/topics/world-news' }
+      { name: 'AP News', url: 'https://rsshub.app/apnews/topics/world-news' },
     ];
 
     const fetchFeed = (feed) => new Promise((resolve) => {
@@ -734,6 +793,79 @@ const server = http.createServer((req, res) => {
         doFetch(all);
       });
     }
+    return;
+  }
+
+  // ── /trends — Google Trending searches по країнах ──
+  if (req.url.startsWith('/trends')) {
+    const params = new URLSearchParams(req.url.split('?')[1]||'');
+    const geos = (params.get('geo') || 'US,GB,DE,UA,IN,FR').split(',');
+    const q = (params.get('q') || '').toLowerCase();
+
+    // Cache 15 хвилин
+    const cacheKey = 'trends:'+geos.join(',');
+    const cached = getCached(cacheKey);
+    if (cached) {
+      const data = JSON.parse(cached);
+      // Filter by query if provided
+      const result = q ? data.filter(t => t.title.toLowerCase().includes(q)) : data;
+      res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+      res.end(JSON.stringify({ items: result, query: q, fetchedAt: Date.now() }));
+      return;
+    }
+
+    const fetchGeo = (geo) => new Promise((resolve) => {
+      https.get({
+        hostname: 'trends.google.com',
+        path: '/trending/rss?geo='+geo,
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ResonanceBot/1.0)' }
+      }, (r) => {
+        let raw = ''; r.on('data', d => raw += d);
+        r.on('end', () => {
+          try {
+            const titles = [...raw.matchAll(/<title>(?:<!\[CDATA\[)?(.+?)(?:\]\]>)?<\/title>/g)].map(m=>m[1].trim()).slice(1,11);
+            const traffic = [...raw.matchAll(/<ht:approx_traffic>(.+?)<\/ht:approx_traffic>/g)].map(m=>m[1].trim());
+            const items = titles.map((title,i) => ({ title, traffic: traffic[i]||'?', geo }));
+            resolve(items);
+          } catch(e) { resolve([]); }
+        });
+      }).on('error', () => resolve([]));
+    });
+
+    Promise.all(geos.map(fetchGeo)).then(results => {
+      const all = results.flat();
+      setCache(cacheKey, JSON.stringify(all));
+      const result = q ? all.filter(t => t.title.toLowerCase().includes(q)) : all;
+      res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+      res.end(JSON.stringify({ items: result, total: all.length, query: q, fetchedAt: Date.now() }));
+    });
+    return;
+  }
+
+  // ── /hn — Hacker News search ──
+  if (req.url.startsWith('/hn?')) {
+    const q = new URLSearchParams(req.url.split('?')[1]||'').get('q') || '';
+    if (!q) { res.writeHead(400); res.end('{}'); return; }
+    const hnUrl = 'https://hn.algolia.com/api/v1/search?query='+encodeURIComponent(q)+'&tags=story&hitsPerPage=5';
+    https.get(hnUrl, { headers: { 'User-Agent': 'ResonanceProxy/1.0' } }, (r) => {
+      let raw = ''; r.on('data', d => raw += d);
+      r.on('end', () => {
+        try {
+          const data = JSON.parse(raw);
+          const items = (data.hits||[]).map(h => ({
+            title: h.title,
+            url: h.url || 'https://news.ycombinator.com/item?id='+h.objectID,
+            source: 'Hacker News · '+h.points+'pts',
+            date: h.created_at
+          }));
+          res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+          res.end(JSON.stringify({ items, query: q, fetchedAt: Date.now() }));
+        } catch(e) {
+          res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+          res.end(JSON.stringify({ items: [], query: q }));
+        }
+      });
+    }).on('error', () => { res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'}); res.end('{}'); });
     return;
   }
 
@@ -1234,3 +1366,85 @@ function findCrossSignals() {
 
   return signals;
 }
+
+// ════════════════════════════════════════
+// PAGEVIEW POLLER — кожні 10 хв через Vercel edge
+// Пише pageview_spikes в Supabase → всі браузери бачать однаково
+// ════════════════════════════════════════
+
+const VERCEL_PV = 'https://resonance-dashboard-7a1u.vercel.app/api/pageviews';
+
+async function pollPageviews() {
+  if (!trendingCache.items.length) return;
+
+  // Беремо топ-30 trending + активні edit аномалії
+  const trendTitles = trendingCache.items.slice(0, 20).map(t => t.article);
+  const anomTitles  = Object.keys(anomWindow)
+    .map(k => k.split(':').slice(1).join(':'))
+    .filter(Boolean)
+    .slice(0, 10);
+
+  // Унікальні, без дублів
+  const allTitles = [...new Set([...trendTitles, ...anomTitles])];
+  if (!allTitles.length) return;
+
+  const encoded = allTitles.map(t => encodeURIComponent(t.replace(/ /g,'_'))).join(',');
+  const url = VERCEL_PV + '?titles=' + encoded + '&lang=en&mode=hourly';
+
+  try {
+    const r = await fetch(url);
+    if (!r.ok) { console.log('PV poll error:', r.status); return; }
+    const data = await r.json();
+    if (!data.batch) return;
+
+    const now = Date.now();
+    let inserted = 0;
+
+    for (const [rawTitle, pv] of Object.entries(data.batch)) {
+      if (!pv || !pv.items || pv.items.length < 3) continue;
+      const { ratio, trend, items } = pv;
+      if (ratio < 2) continue; // тільки справжні спайки
+
+      const title = rawTitle.replace(/_/g, ' ');
+      const lastViews = items[items.length - 1]?.v || 0;
+
+      // Серіалізуємо останні 24 год (погодинно) для спарклайну
+      const sparkline = items.slice(-24).map(i => i.v);
+
+      supabaseInsert('pageview_spikes', {
+        title,
+        lang: 'en',
+        ratio: Math.round(ratio * 10) / 10,
+        trend_pct: trend || 0,
+        last_views: lastViews,
+        sparkline: JSON.stringify(sparkline),
+        url: 'https://en.wikipedia.org/wiki/' + encodeURIComponent(title.replace(/ /g,'_')),
+        is_trending: trendingCache.items.some(t => t.article === title)
+      });
+      inserted++;
+
+      // Якщо дуже різкий спайк — cross_signal
+      if (ratio >= 5) {
+        supabaseInsert('cross_signals', {
+          type: 'WIKI+PAGEVIEW',
+          title,
+          detail: '×' + ratio.toFixed(1) + ' від норми · ' + lastViews.toLocaleString() + ' переглядів',
+          wiki_title: title,
+          crypto_symbol: null,
+          score: Math.min(ratio * 10, 100)
+        });
+      }
+    }
+
+    if (inserted > 0) console.log('PV poll: inserted', inserted, 'spikes');
+  } catch(e) {
+    console.log('PV poll fetch error:', e.message);
+  }
+}
+
+// Додаємо /pv endpoint щоб дашборд читав поточні спайки
+// (замість локального pvPinned — тепер з Supabase)
+
+// Старт + інтервал кожні 10 хв
+setTimeout(pollPageviews, 30000); // перший запуск через 30 сек після старту
+setInterval(pollPageviews, 600000);
