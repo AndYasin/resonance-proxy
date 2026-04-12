@@ -273,6 +273,22 @@ async function checkAnomaly(title, wiki, user, isBot) {
     ]);
     const { type, langCount } = info;
 
+    // ── Записуємо всі аномалії в Supabase ──
+    supabaseInsert('anomalies', {
+      title: title,
+      wiki: wiki,
+      lang: lang,
+      type: uniq300 >= 2 ? 'mul' : 'sng',
+      edits: hits300,
+      editors: uniq300,
+      lang_count: info.langCount,
+      article_type: (info.type || '').replace(/[^a-zA-Zа-яА-ЯіІїЇєЄ\s]/g,'').trim(),
+      url: 'https://' + lang + '.wikipedia.org/wiki/' + encodeURIComponent(title.replace(/ /g,'_')),
+      score: (editors300 || editors60) * 3 + (hits300 || hits60),
+      is_trending: info.langCount >= 50,
+      trend_pct: null
+    });
+
     // Strict importance filter for Telegram
     const isImportant =
       type.includes('СМЕРТЬ') ||
