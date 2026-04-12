@@ -492,50 +492,72 @@ const server = http.createServer((req, res) => {
     'X-Accel-Buffering': 'no'
   });
 
-  function connectUpstream() {
-    const req2 = https.get({
-      hostname: 'stream.wikimedia.org',
-      path: '/v2/stream/recentchange',
-      headers: { 'Accept': 'text/event-stream', 'User-Agent': 'ResonanceProxy/1.0' }
-    }, (upstream) => {
-      upstream.on('data', chunk => {
-        try {
-          chunk.toString().split('\n').forEach(line => {
-            if (!line.startsWith('data: ')) return;
-            try {
-              const data = JSON.parse(line.slice(6));
-              if ((data.type === 'edit' || data.type === 'new') &&
-                  ALL_WIKIS.has(data.wiki) &&
-                  data.title && !data.title.includes(':')) {
-                checkAnomaly(data.title, data.wiki, data.user, data.bot);
-                try {
-                  res.write('data: ' + JSON.stringify({
-                    title: data.title, wiki: data.wiki,
-                    user: data.user, bot: data.bot,
-                    type: data.type, timestamp: data.timestamp,
-                    tier: getTier(data.wiki)
-                  }) + '\n\n');
-                } catch(e) {}
-              }
-            } catch(e) {}
-          });
-        } catch(e) {}
-      });
-      upstream.on('end', () => {
-        console.log('Upstream ended, reconnecting in 2s...');
-        setTimeout(connectUpstream, 2000);
-      });
-      upstream.on('error', (e) => {
-        console.log('Upstream error:', e.message, '— reconnecting');
-        setTimeout(connectUpstream, 2000);
-      });
-    });
-    req2.on('error', () => setTimeout(connectUpstream, 2000));
-  }
+  // Send current client heartbeat every 25s
+  const heartbeat = setInterval(() => {
+    try { res.write(': ping\n\n'); } catch(e) { clearInterval(heartbeat); }
+  }, 25000);
 
-  connectUpstream();
-  req.on('close', () => res.end());
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    sseClients.delete(res);
+    res.end();
+  });
+
+  sseClients.add(res);
 });
+
+// ── GLOBAL UPSTREAM — runs independently of clients ──
+const sseClients = new Set();
+
+function connectGlobalUpstream() {
+  const req2 = https.get({
+    hostname: 'stream.wikimedia.org',
+    path: '/v2/stream/recentchange',
+    headers: { 'Accept': 'text/event-stream', 'User-Agent': 'ResonanceProxy/1.0' }
+  }, (upstream) => {
+    console.log('Wikipedia upstream connected');
+    upstream.on('data', chunk => {
+      try {
+        chunk.toString().split('\n').forEach(line => {
+          if (!line.startsWith('data: ')) return;
+          try {
+            const data = JSON.parse(line.slice(6));
+            if ((data.type === 'edit' || data.type === 'new') &&
+                ALL_WIKIS.has(data.wiki) &&
+                data.title && !data.title.includes(':')) {
+              checkAnomaly(data.title, data.wiki, data.user, data.bot);
+              const msg = 'data: ' + JSON.stringify({
+                title: data.title, wiki: data.wiki,
+                user: data.user, bot: data.bot,
+                type: data.type, timestamp: data.timestamp,
+                tier: getTier(data.wiki)
+              }) + '\n\n';
+              // Broadcast to all connected clients
+              sseClients.forEach(client => {
+                try { client.write(msg); } catch(e) { sseClients.delete(client); }
+              });
+            }
+          } catch(e) {}
+        });
+      } catch(e) {}
+    });
+    upstream.on('end', () => {
+      console.log('Upstream ended, reconnecting in 2s...');
+      setTimeout(connectGlobalUpstream, 2000);
+    });
+    upstream.on('error', (e) => {
+      console.log('Upstream error:', e.message, '— reconnecting');
+      setTimeout(connectGlobalUpstream, 2000);
+    });
+  });
+  req2.on('error', (e) => {
+    console.log('Upstream req error:', e.message);
+    setTimeout(connectGlobalUpstream, 5000);
+  });
+}
+
+// Start global Wikipedia upstream immediately on launch
+connectGlobalUpstream();
 
 server.listen(process.env.PORT || 3000, '0.0.0.0', () => {
   console.log('Resonance proxy on port ' + (process.env.PORT || 3000));
