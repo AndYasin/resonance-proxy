@@ -1,6 +1,36 @@
 const http = require('http');
 const https = require('https');
 
+// ── SUPABASE ──
+const SUPABASE_URL = process.env.SUPABASE_URL || '';
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY || '';
+
+function supabaseInsert(table, data) {
+  if (!SUPABASE_URL || !SUPABASE_KEY) return;
+  const body = JSON.stringify(data);
+  const url = new URL(SUPABASE_URL + '/rest/v1/' + table);
+  const req = https.request({
+    hostname: url.hostname,
+    path: url.pathname,
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(body),
+      'apikey': SUPABASE_KEY,
+      'Authorization': 'Bearer ' + SUPABASE_KEY,
+      'Prefer': 'return=minimal'
+    }
+  }, (res) => {
+    if (res.statusCode >= 400) {
+      let d = ''; res.on('data', c => d += c);
+      res.on('end', () => console.log('Supabase error:', res.statusCode, d.slice(0, 100)));
+    }
+  });
+  req.on('error', e => console.log('Supabase req error:', e.message));
+  req.write(body);
+  req.end();
+}
+
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
@@ -771,6 +801,33 @@ async function fetchBinanceStats() {
 
           binanceStatsCache = { items, fetchedAt: now };
           console.log('Binance updated:', items.length, 'pairs, top mover:', items[0]?.symbol, items[0]?.change + '%');
+
+          // Save anomalies to Supabase
+          const anomalies = items.filter(t => t.isAnomaly);
+          if (anomalies.length > 0) {
+            anomalies.forEach(t => {
+              supabaseInsert('binance_snapshots', {
+                symbol: t.symbol,
+                price: t.price,
+                change_pct: t.change,
+                volume: t.vol,
+                is_anomaly: true
+              });
+            });
+          }
+          // Save all snapshots every 10 min (not every minute to save space)
+          if (now % 600000 < 180000) {
+            items.forEach(t => {
+              supabaseInsert('binance_snapshots', {
+                symbol: t.symbol,
+                price: t.price,
+                change_pct: t.change,
+                volume: t.vol,
+                is_anomaly: t.isAnomaly
+              });
+            });
+          }
+
           resolve(items);
         } catch(e) {
           console.log('Binance parse error:', e.message, data.slice(0, 100));
