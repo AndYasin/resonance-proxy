@@ -550,15 +550,14 @@ const server = http.createServer((req, res) => {
           }));
           const tones = articles.map(a=>parseFloat(a.tone)).filter(t=>!isNaN(t));
           const avgTone = tones.length ? (tones.reduce((a,b)=>a+b,0)/tones.length).toFixed(1) : 0;
-          setCors(res);
-          res.writeHead(200, {'Content-Type':'application/json'});
+          res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
           res.end(JSON.stringify({ items: articles, avgTone: parseFloat(avgTone), query: q, fetchedAt: Date.now() }));
         } catch(e) {
-          setCors(res); res.writeHead(200, {'Content-Type':'application/json'});
+          res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
           res.end(JSON.stringify({ items: [], avgTone: 0, query: q }));
         }
       });
-    }).on('error', () => { setCors(res); res.writeHead(200); res.end(JSON.stringify({items:[],avgTone:0})); });
+    }).on('error', () => { res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'}); res.end(JSON.stringify({items:[],avgTone:0})); });
     return;
   }
 
