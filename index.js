@@ -2,6 +2,65 @@ const http = require('http');
 const https = require('https');
 
 // ── GDELT AUTO-SIGNAL ──
+// ── POLYMARKET CROSS-SIGNAL ──
+let polyCache = { items: [], fetchedAt: 0 };
+
+async function getPolyMarkets() {
+  const now = Date.now();
+  if (now - polyCache.fetchedAt < 300000 && polyCache.items.length) return polyCache.items;
+  return new Promise((resolve) => {
+    https.get({
+      hostname: 'gamma-api.polymarket.com',
+      path: '/markets?closed=false&limit=300&order=volumeNum&ascending=false',
+      headers: { 'User-Agent': 'ResonanceProxy/1.0' }
+    }, (r) => {
+      let raw = ''; r.on('data', d => raw += d);
+      r.on('end', () => {
+        try {
+          const data = JSON.parse(raw);
+          polyCache.items = data;
+          polyCache.fetchedAt = Date.now();
+          console.log('Polymarket cache updated:', data.length, 'markets');
+          resolve(data);
+        } catch(e) { resolve([]); }
+      });
+    }).on('error', () => resolve([]));
+  });
+}
+
+function fetchPolymarketSignal(title, editors) {
+  const words = title.toLowerCase().split(/\s+/).filter(w => w.length > 3);
+  getPolyMarkets().then(markets => {
+    const matches = markets.filter(m => {
+      const q = (m.question||'').toLowerCase();
+      return words.some(w => q.includes(w));
+    });
+    if (!matches.length) return;
+    const top = matches[0];
+    const prices = JSON.parse(top.outcomePrices||'[]');
+    const yesProb = Math.round(parseFloat(prices[0]||0)*100);
+    const vol = Math.round((top.volumeNum||0)/1000);
+    console.log('Polymarket match:', title, '->', (top.question||'').slice(0,60), '| YES:', yesProb+'%', '| vol: $'+vol+'K');
+    supabaseInsert('cross_signals', {
+      type: 'WIKI+POLYMARKET',
+      title: title,
+      detail: 'YES:'+yesProb+'% vol:$'+vol+'K q:'+(top.question||'').slice(0,100),
+      wiki_title: title,
+      crypto_symbol: null,
+      score: yesProb * Math.log(vol+1)
+    });
+    if (editors >= 2 && vol > 100 && TELEGRAM_TOKEN) {
+      const emoji = yesProb > 70 ? '🟢' : yesProb > 40 ? '🟡' : '🔴';
+      sendTelegram(
+        emoji + ' <b>Polymarket сигнал: ' + title + '</b>\n\n' +
+        '📊 ' + (top.question||'').slice(0,80) + '\n' +
+        '💰 YES: <b>' + yesProb + '%</b> | Обсяг: $' + vol + 'K\n' +
+        '🔗 <a href="https://polymarket.com/event/' + (top.slug||'') + '">відкрити ринок</a>'
+      );
+    }
+  }).catch(() => {});
+}
+
 // GDELT rate limiter — max 1 req per 6 sec
 let lastGdeltCall = 0;
 const gdeltQueue = [];
@@ -76,20 +135,24 @@ function fetchGdeltSignal(title, lang, wiki, edits, editors) {
 const SUPABASE_URL = process.env.SUPABASE_URL || '';
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY || '';
 
-function supabaseInsert(table, data) {
+function supabaseInsert(table, data, upsertOn) {
   if (!SUPABASE_URL || !SUPABASE_KEY) return;
-  const body = JSON.stringify(data);
+  const body = JSON.stringify(upsertOn ? data : Array.isArray(data) ? data : data);
   const url = new URL(SUPABASE_URL + '/rest/v1/' + table);
+  // For anomalies — upsert on title+wiki to avoid duplicates
+  const prefer = upsertOn
+    ? 'return=minimal,resolution=merge-duplicates'
+    : 'return=minimal';
   const req = https.request({
     hostname: url.hostname,
-    path: url.pathname,
+    path: url.pathname + (upsertOn ? '?on_conflict='+upsertOn : ''),
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       'Content-Length': Buffer.byteLength(body),
       'apikey': SUPABASE_KEY,
       'Authorization': 'Bearer ' + SUPABASE_KEY,
-      'Prefer': 'return=minimal'
+      'Prefer': prefer
     }
   }, (res) => {
     if (res.statusCode >= 400) {
@@ -395,8 +458,10 @@ async function checkAnomaly(title, wiki, user, isBot) {
     ]);
     const { type, langCount } = info;
 
-    // ── GDELT auto-enrich — шукаємо новини про аномалію ──
+    // ── GDELT auto-enrich ──
     fetchGdeltSignal(title, lang, wiki, hits300, uniq300);
+    // ── Polymarket cross-signal ──
+    fetchPolymarketSignal(title, uniq300);
 
     // ── Записуємо всі аномалії в Supabase ──
     supabaseInsert('anomalies', {
@@ -594,6 +659,65 @@ const server = http.createServer((req, res) => {
     }).catch(() => {
       res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
       res.end(JSON.stringify({ items: [], avgTone: 0, query: q }));
+    });
+    return;
+  }
+
+  // ── /polymarket — активні ринки з ймовірностями ──
+  if (req.url.startsWith('/polymarket')) {
+    const params = new URLSearchParams(req.url.split('?')[1]||'');
+    const q = (params.get('q')||'').toLowerCase();
+    const limit = parseInt(params.get('limit')||'200');
+
+    https.get({
+      hostname: 'gamma-api.polymarket.com',
+      path: '/markets?closed=false&limit='+limit+'&order=volumeNum&ascending=false',
+      headers: { 'User-Agent': 'ResonanceProxy/1.0' }
+    }, (pr) => {
+      let raw = '';
+      pr.on('data', d => raw += d);
+      pr.on('end', () => {
+        try {
+          const data = JSON.parse(raw);
+          let markets = data.map(m => {
+            const prices = JSON.parse(m.outcomePrices||'[]');
+            const outcomes = JSON.parse(m.outcomes||'[]');
+            const yesProb = parseFloat(prices[0]||0);
+            return {
+              id: m.id,
+              question: m.question,
+              slug: m.slug,
+              endDate: m.endDate,
+              yesProb: yesProb,
+              yesPrice: Math.round(yesProb*100),
+              volume: Math.round(m.volumeNum||0),
+              liquidity: Math.round(m.liquidityNum||0),
+              outcomes: outcomes,
+              prices: prices,
+              url: 'https://polymarket.com/event/'+m.slug
+            };
+          });
+
+          // Filter by keyword if provided
+          if (q) {
+            markets = markets.filter(m =>
+              m.question.toLowerCase().includes(q)
+            );
+          }
+
+          // Sort by volume
+          markets.sort((a,b) => b.volume - a.volume);
+
+          res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+          res.end(JSON.stringify({ items: markets.slice(0,50), total: markets.length, fetchedAt: Date.now() }));
+        } catch(e) {
+          res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+          res.end(JSON.stringify({ items: [], total: 0, error: e.message }));
+        }
+      });
+    }).on('error', () => {
+      res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+      res.end(JSON.stringify({ items: [], total: 0 }));
     });
     return;
   }
