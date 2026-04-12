@@ -251,7 +251,7 @@ async function checkAnomaly(title, wiki, user, isBot) {
   w.ts60  = w.ts60.filter(t => now - t < 60000);
   w.ts300 = w.ts300.filter(t => now - t < 300000);
   if (w.ts60.length === 0) w.users60 = new Set();
-  if (w.ts300.length === 0) { w.users300 = new Set(); w.firedMulti = false; w.firedSingle = false; }
+  if (w.ts300.length === 0) { w.users300 = new Set(); w.firedMulti = false; w.firedSingle = false; w.firedSupabase = false; }
 
   const hits60  = w.ts60.length;
   const uniq60  = w.users60.size;
@@ -261,6 +261,25 @@ async function checkAnomaly(title, wiki, user, isBot) {
   const tgThreshold    = getTgThreshold(wiki);
   const spikeThreshold = getSpikeThreshold(wiki);
   const alertKey = key + ':' + Math.floor(now / 300000);
+
+  // ── Supabase: записуємо при 2+ редакторах (незалежно від TG) ──
+  if (uniq300 >= 2 && hits300 >= 2 && !w.firedSupabase) {
+    w.firedSupabase = true;
+    supabaseInsert('anomalies', {
+      title: title,
+      wiki: wiki,
+      lang: lang,
+      type: 'mul',
+      edits: hits300,
+      editors: uniq300,
+      lang_count: 0,
+      article_type: '',
+      url: 'https://' + lang + '.wikipedia.org/wiki/' + encodeURIComponent(title.replace(/ /g,'_')),
+      score: uniq300 * 3 + hits300,
+      is_trending: false,
+      trend_pct: null
+    });
+  }
 
   // ── TELEGRAM: N+ unique editors in 5 min (tier-based) ──
   if (uniq300 >= tgThreshold && !w.firedMulti && !sentAlerts[alertKey + ':tg']) {
