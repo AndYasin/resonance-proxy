@@ -32,9 +32,9 @@ function getDashThreshold(wiki) {
 // Telegram alert thresholds (unique editors in 300s)
 function getTgThreshold(wiki) {
   const t = getTier(wiki);
-  if (t === 1) return 4;
-  if (t === 2) return 5;
-  return 6;
+  if (t === 1) return 5;
+  if (t === 2) return 6;
+  return 7;
 }
 
 // Telegram single spike thresholds (edits in 60s from one editor)
@@ -166,6 +166,13 @@ async function fetchTrending() {
   try {
     const [todayTop, yestTop] = await Promise.all([getTop(td), getTop(yd)]);
     console.log('Got', todayTop.length, 'today,', yestTop.length, 'yesterday');
+
+    // Fallback: якщо сьогодні 0 (нічний час UTC) — використовуємо вчора vs позавчора
+    const effectiveToday = todayTop.length > 0 ? todayTop : yestTop;
+    const effectiveYest = todayTop.length > 0 ? yestTop : (await getTop(fmt(new Date(now - 172800000 - 86400000))));
+    const isUsingFallback = todayTop.length === 0;
+    if (isUsingFallback) console.log('Using yesterday as fallback (today=0)');
+
     const yestMap = {};
     yestTop.forEach(a => { yestMap[a.article] = a.views; });
     const trending = todayTop
@@ -187,6 +194,17 @@ fetchTrending();
 setInterval(fetchTrending, 1800000);
 
 // ── ANOMALY CHECK ──
+function looksLikeBot(user, isBot) {
+  if (isBot) return true;
+  if (!user) return false;
+  // Wikipedia temporary accounts start with ~
+  if (user.startsWith('~')) return true;
+  // IP addresses
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(user)) return true;
+  if (/^[0-9a-f:]+:[0-9a-f:]+$/i.test(user)) return true; // IPv6
+  return false;
+}
+
 async function checkAnomaly(title, wiki, user, isBot) {
   const lang = wiki.replace('wiki', '') || 'en';
   const key = wiki + ':' + title;
@@ -198,7 +216,8 @@ async function checkAnomaly(title, wiki, user, isBot) {
   const w = anomWindow[key];
   w.lastSeen = now;
   w.ts60.push(now); w.ts300.push(now);
-  if (user && !isBot) { w.users60.add(user); w.users300.add(user); }
+  // Не рахуємо ботів і тимчасові акаунти як унікальних редакторів
+  if (user && !looksLikeBot(user, isBot)) { w.users60.add(user); w.users300.add(user); }
   w.ts60  = w.ts60.filter(t => now - t < 60000);
   w.ts300 = w.ts300.filter(t => now - t < 300000);
   if (w.ts60.length === 0) w.users60 = new Set();
@@ -265,13 +284,13 @@ async function checkAnomaly(title, wiki, user, isBot) {
     }
   }
 
-  // ── TELEGRAM: single spike (tier-based, only deaths/geopolitics/global) ──
-  if (hits60 >= spikeThreshold && uniq60 <= 1 && !w.firedSingle && !sentAlerts[alertKey + ':single']) {
+  // ── TELEGRAM: single spike — тільки смерть або 100+ мов, поріг 15+ ──
+  if (hits60 >= 15 && uniq60 <= 1 && !w.firedSingle && !sentAlerts[alertKey + ':single']) {
     w.firedSingle = true;
     sentAlerts[alertKey + ':single'] = true;
     const info = await getWikiInfo(title, lang);
-    // Single spikes only for very important content
-    if (info.type.includes('СМЕРТЬ') || info.type.includes('ГЕОПОЛІТИКА') || info.langCount >= 50) {
+    // Single spikes тільки для смерті або дуже глобальних статей
+    if (info.type.includes('СМЕРТЬ') || info.langCount >= 100) {
       const pvData = await getViewsRatio(lang, title);
       const wikiUrl = 'https://' + lang + '.wikipedia.org/wiki/' + encodeURIComponent(title.replace(/ /g,'_'));
       let pvLine = pvData && pvData.ratio >= 3 ? '\n📈 x' + pvData.ratio + ' переглядів (' + pvData.today.toLocaleString() + ')' : '';
@@ -309,6 +328,137 @@ const server = http.createServer((req, res) => {
   if (req.url === '/trending') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ items: trendingCache.items, fetchedAt: trendingCache.fetchedAt, count: trendingCache.items.length }));
+    return;
+  }
+
+  // /ai endpoint — proxy to Claude API with web search
+  if (req.url.startsWith('/ai?')) {
+    const params = new URL('http://localhost' + req.url).searchParams;
+    const article = params.get('q') || '';
+    const today = new Date().toLocaleDateString('uk-UA', {day:'numeric', month:'long', year:'numeric'});
+    const prompt = 'Стаття "' + article + '" сьогодні (' + today + ') різко зросла у переглядах на Wikipedia. Коротко поясни українською мовою (3-5 речень) що сталось з цією темою сьогодні або вчора. Якщо це персона — хто це і яка подія. Будь конкретним і фактичним. Не використовуй markdown форматування.';
+
+    const body = JSON.stringify({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 800,
+      messages: [{ role: 'user', content: prompt }],
+      tools: [{ type: 'web_search_20250305', name: 'web_search' }]
+    });
+
+    const apiReq = https.request({
+      hostname: 'api.anthropic.com',
+      path: '/v1/messages',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+        'anthropic-version': '2023-06-01',
+        'x-api-key': process.env.ANTHROPIC_API_KEY || ''
+      }
+    }, (apiRes) => {
+      let data = '';
+      apiRes.on('data', c => data += c);
+      apiRes.on('end', () => {
+        try {
+          const json = JSON.parse(data);
+          const text = (json.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n').trim();
+          res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+          res.end(JSON.stringify({ text, article }));
+        } catch(e) {
+          res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+          res.end(JSON.stringify({ error: e.message }));
+        }
+      });
+    });
+    apiReq.on('error', e => {
+      res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: e.message }));
+    });
+    apiReq.write(body);
+    apiReq.end();
+    return;
+  }
+
+  // /ping endpoint — keepalive
+  if (req.url === '/ping') {
+    res.writeHead(200, { 'Content-Type': 'text/plain', 'Access-Control-Allow-Origin': '*' });
+    res.end('ok');
+    return;
+  }
+
+  // /ddg endpoint — DuckDuckGo news proxy
+  if (req.url.startsWith('/ddg?')) {
+    const q = new URL('http://localhost' + req.url).searchParams.get('q') || '';
+    https.get({
+      hostname: 'api.duckduckgo.com',
+      path: '/?q=' + encodeURIComponent(q) + '&format=json&no_html=1&skip_disambig=1',
+      headers: { 'User-Agent': 'ResonanceBot/1.0' }
+    }, (apiRes) => {
+      let data = '';
+      apiRes.on('data', c => data += c);
+      apiRes.on('end', () => {
+        try {
+          const json = JSON.parse(data);
+          const items = [];
+          // RelatedTopics as news-like items
+          (json.RelatedTopics || []).slice(0,5).forEach(t => {
+            if (t.Text && t.FirstURL) {
+              items.push({ title: t.Text.slice(0,120), url: t.FirstURL, source: 'DuckDuckGo', date: '' });
+            }
+          });
+          // Abstract
+          if (json.AbstractText) {
+            items.unshift({ title: json.AbstractText.slice(0,200), url: json.AbstractURL || '#', source: json.AbstractSource || 'DuckDuckGo', date: 'today' });
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+          res.end(JSON.stringify({ items }));
+        } catch(e) {
+          res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+          res.end(JSON.stringify({ items: [] }));
+        }
+      });
+    }).on('error', () => {
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ items: [] }));
+    });
+    return;
+  }
+
+  // /gnews endpoint — GNews API proxy (free tier, no key needed for basic)
+  if (req.url.startsWith('/gnews?')) {
+    const q = new URL('http://localhost' + req.url).searchParams.get('q') || '';
+    const GNEWS_KEY = process.env.GNEWS_API_KEY || '';
+    const path = GNEWS_KEY
+      ? '/v4/search?q=' + encodeURIComponent(q) + '&lang=en&max=5&token=' + GNEWS_KEY
+      : '/v4/search?q=' + encodeURIComponent(q) + '&lang=en&max=5';
+
+    https.get({
+      hostname: 'gnews.io',
+      path: path,
+      headers: { 'User-Agent': 'ResonanceBot/1.0' }
+    }, (apiRes) => {
+      let data = '';
+      apiRes.on('data', c => data += c);
+      apiRes.on('end', () => {
+        try {
+          const json = JSON.parse(data);
+          const items = (json.articles || []).map(a => ({
+            title: a.title,
+            url: a.url,
+            source: a.source?.name || 'GNews',
+            date: a.publishedAt ? new Date(a.publishedAt).toLocaleString('uk-UA', {day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'}) : ''
+          }));
+          res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+          res.end(JSON.stringify({ items }));
+        } catch(e) {
+          res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+          res.end(JSON.stringify({ items: [], error: e.message }));
+        }
+      });
+    }).on('error', e => {
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ items: [] }));
+    });
     return;
   }
 
@@ -371,8 +521,14 @@ const server = http.createServer((req, res) => {
           });
         } catch(e) {}
       });
-      upstream.on('end', () => setTimeout(connectUpstream, 2000));
-      upstream.on('error', () => setTimeout(connectUpstream, 2000));
+      upstream.on('end', () => {
+        console.log('Upstream ended, reconnecting in 2s...');
+        setTimeout(connectUpstream, 2000);
+      });
+      upstream.on('error', (e) => {
+        console.log('Upstream error:', e.message, '— reconnecting');
+        setTimeout(connectUpstream, 2000);
+      });
     });
     req2.on('error', () => setTimeout(connectUpstream, 2000));
   }
@@ -550,7 +706,14 @@ async function fetchBinanceStats() {
       let data = ''; res.on('data', c => data += c);
       res.on('end', () => {
         try {
-          const tickers = JSON.parse(data);
+          const parsed = JSON.parse(data);
+          // Binance returns error object if rate limited, not array
+          if (!Array.isArray(parsed)) {
+            console.log('Binance rate limit or error:', parsed.msg || JSON.stringify(parsed).slice(0,80));
+            resolve([]);
+            return;
+          }
+          const tickers = parsed;
           const now = Date.now();
 
           const items = tickers.map(t => {
@@ -597,7 +760,7 @@ async function fetchBinanceStats() {
 }
 
 connectBinance();
-setInterval(fetchBinanceStats, 60000); // every minute
+setInterval(fetchBinanceStats, 180000); // every 3 min to avoid rate limits
 
 
 // ════════════════════════════════════════
