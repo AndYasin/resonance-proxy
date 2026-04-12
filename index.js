@@ -1,6 +1,56 @@
 const http = require('http');
 const https = require('https');
 
+// ── GDELT AUTO-SIGNAL ──
+function fetchGdeltSignal(title, lang, wiki, edits, editors) {
+  const url = 'https://api.gdeltproject.org/api/v2/doc/doc?query='
+    + encodeURIComponent(title)
+    + '&mode=artlist&maxrecords=5&timespan=1440&sort=tonedesc&format=json';
+
+  https.get(url, { headers: { 'User-Agent': 'ResonanceProxy/1.0' } }, (r) => {
+    let raw = '';
+    r.on('data', d => raw += d);
+    r.on('end', () => {
+      try {
+        const data = JSON.parse(raw);
+        const articles = data.articles || [];
+        if (!articles.length) return;
+
+        // Avg tone
+        const tones = articles.map(a => parseFloat(a.tone||0)).filter(t=>!isNaN(t));
+        const avgTone = tones.length ? tones.reduce((a,b)=>a+b,0)/tones.length : 0;
+        const countries = [...new Set(articles.map(a=>a.sourcecountry).filter(Boolean))];
+
+        console.log('GDELT signal:', title, '| tone:', avgTone.toFixed(1), '| sources:', articles.length, '| countries:', countries.join(','));
+
+        // Save cross-signal to Supabase
+        if (articles.length >= 2) {
+          supabaseInsert('cross_signals', {
+            type: 'WIKI+GDELT',
+            title: title,
+            detail: 'tone:'+avgTone.toFixed(1)+' sources:'+articles.length+' countries:'+countries.slice(0,3).join(','),
+            wiki_title: title,
+            crypto_symbol: null,
+            score: Math.abs(avgTone) * articles.length
+          });
+        }
+
+        // Telegram alert if strong negative tone + multi-editor
+        if (avgTone < -5 && editors >= 3 && TELEGRAM_TOKEN) {
+          const toneEmoji = avgTone < -10 ? '🔴' : '🟡';
+          sendTelegram(
+            toneEmoji + ' <b>GDELT сигнал: ' + title + '</b>\n\n' +
+            '📰 ' + articles.length + ' джерел у ' + countries.length + ' країнах\n' +
+            '😟 Тональність: ' + avgTone.toFixed(1) + ' (негативна)\n' +
+            '📝 ' + articles[0].title.slice(0, 100) + '\n\n' +
+            '🔗 <a href="' + articles[0].url + '">читати</a>'
+          );
+        }
+      } catch(e) {}
+    });
+  }).on('error', () => {});
+}
+
 // ── SUPABASE ──
 const SUPABASE_URL = process.env.SUPABASE_URL || '';
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY || '';
@@ -324,6 +374,9 @@ async function checkAnomaly(title, wiki, user, isBot) {
     ]);
     const { type, langCount } = info;
 
+    // ── GDELT auto-enrich — шукаємо новини про аномалію ──
+    fetchGdeltSignal(title, lang, wiki, hits300, uniq300);
+
     // ── Записуємо всі аномалії в Supabase ──
     supabaseInsert('anomalies', {
       title: title,
@@ -473,6 +526,39 @@ const server = http.createServer((req, res) => {
     });
     apiReq.write(body);
     apiReq.end();
+    return;
+  }
+
+  // ── /gdelt — новини + тональність по темі ──
+  if (req.url.startsWith('/gdelt?')) {
+    const params = new URLSearchParams(req.url.slice(7));
+    const q = params.get('q') || '';
+    if (!q) { res.writeHead(400); res.end('{}'); return; }
+    const gdeltUrl = 'https://api.gdeltproject.org/api/v2/doc/doc?query='
+      + encodeURIComponent(q)
+      + '&mode=artlist&maxrecords=10&timespan=1440&sort=tonedesc&format=json';
+    https.get(gdeltUrl, { headers: { 'User-Agent': 'ResonanceProxy/1.0' } }, (gr) => {
+      let raw = '';
+      gr.on('data', d => raw += d);
+      gr.on('end', () => {
+        try {
+          const data = JSON.parse(raw);
+          const articles = (data.articles || []).map(a => ({
+            title: a.title, url: a.url, source: a.domain,
+            date: a.seendate, tone: parseFloat(a.tone||0).toFixed(1),
+            country: a.sourcecountry, lang: a.sourcelang
+          }));
+          const tones = articles.map(a=>parseFloat(a.tone)).filter(t=>!isNaN(t));
+          const avgTone = tones.length ? (tones.reduce((a,b)=>a+b,0)/tones.length).toFixed(1) : 0;
+          setCors(res);
+          res.writeHead(200, {'Content-Type':'application/json'});
+          res.end(JSON.stringify({ items: articles, avgTone: parseFloat(avgTone), query: q, fetchedAt: Date.now() }));
+        } catch(e) {
+          setCors(res); res.writeHead(200, {'Content-Type':'application/json'});
+          res.end(JSON.stringify({ items: [], avgTone: 0, query: q }));
+        }
+      });
+    }).on('error', () => { setCors(res); res.writeHead(200); res.end(JSON.stringify({items:[],avgTone:0})); });
     return;
   }
 
