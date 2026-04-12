@@ -464,58 +464,61 @@ async function checkAnomaly(title, wiki, user, isBot) {
   const spikeThreshold = getSpikeThreshold(wiki);
   const alertKey = key + ':' + Math.floor(now / 300000);
 
-  // ── Supabase: записуємо при 2+ редакторах з повними даними ──
-  if (uniq300 >= 2 && hits300 >= 2 && !w.firedSupabase) {
-    w.firedSupabase = true;
-    const wikiUrl = 'https://' + lang + '.wikipedia.org/wiki/' + encodeURIComponent(title.replace(/ /g,'_'));
+  // ── Supabase: записуємо при 2+ редакторах, оновлюємо при кожному новому ──
+  if (uniq300 >= 2 && hits300 >= 2) {
+    // Пишемо якщо: перший раз АБО новий редактор АБО кожні 2 хв
+    const shouldWrite = !w.firedSupabase
+      || uniq300 > (w.lastUniq300 || 0)
+      || (now - (w.lastSupa || 0)) > 120000;
+    if (shouldWrite) {
+      w.firedSupabase = true;
+      w.lastUniq300 = uniq300;
+      w.lastSupa = now;
+      const wikiUrl = 'https://' + lang + '.wikipedia.org/wiki/' + encodeURIComponent(title.replace(/ /g,'_'));
 
-    // Збираємо повні дані асинхронно перед записом
-    Promise.all([
-      getWikiInfo(title, lang),
-      getViewsRatio(lang, title)
-    ]).then(([info, pvData]) => {
-      const typeWeights = {'СМЕРТЬ':50,'ГЕОПОЛІТИКА':20,'ПОЛІТИК':18,'ВІЙСЬКОВІ':15,
-        'БІЗНЕС':12,'НАУКА':8,'КУЛЬТУРА':6,'СПОРТ':5,'ФУТБОЛ':4,'ПЕРСОНА':3};
-      const atype = info.type || '';
-      const lc = info.langCount || 0;
-      const pvRatio = pvData ? pvData.ratio : 0;
-      const trendItem = (trendingCache && trendingCache.items) ? trendingCache.items.find(t =>
-        t.article.toLowerCase() === title.toLowerCase()) : null;
-      const trendPct = trendItem ? trendItem.delta : null;
+      Promise.all([
+        getWikiInfo(title, lang),
+        getViewsRatio(lang, title)
+      ]).then(([info, pvData]) => {
+        const typeWeights = {'СМЕРТЬ':50,'ГЕОПОЛІТИКА':20,'ПОЛІТИК':18,'ВІЙСЬКОВІ':15,
+          'БІЗНЕС':12,'НАУКА':8,'КУЛЬТУРА':6,'СПОРТ':5,'ФУТБОЛ':4,'ПЕРСОНА':3};
+        const atype = info.type || '';
+        const lc = info.langCount || 0;
+        const pvRatio = pvData ? pvData.ratio : 0;
+        const trendItem = (trendingCache && trendingCache.items) ? trendingCache.items.find(t =>
+          t.article.toLowerCase() === title.toLowerCase()) : null;
+        const trendPct = trendItem ? trendItem.delta : null;
 
-      const typeScore = typeWeights[atype.replace(/[^а-яА-ЯіІїЇєЄa-zA-Z]/g,'')] || 0;
-      const langScore = Math.min(lc * 0.4, 30);
-      const trendScore = trendPct ? Math.min(trendPct / 20, 20) : 0;
-      const pvScore = pvRatio ? Math.min((pvRatio - 1) * 3, 15) : 0;
-      // Експоненційний burst score
-      const e = uniq300;
-      const editorScore = e<=2?e*2.5:e<=4?5+(e-2)*8:e<=9?21+(e-4)*20:121+(e-10)*40;
-      const actScore = editorScore + hits300 * 0.8;
-      const score = typeScore + langScore + trendScore + pvScore + actScore;
+        const typeScore = typeWeights[atype.replace(/[^а-яА-ЯіІїЇєЄa-zA-Z]/g,'')] || 0;
+        const langScore = Math.min(lc * 0.4, 30);
+        const trendScore = trendPct ? Math.min(trendPct / 20, 20) : 0;
+        const pvScore = pvRatio ? Math.min((pvRatio - 1) * 3, 15) : 0;
+        const e = uniq300;
+        const editorScore = e<=2?e*2.5:e<=4?5+(e-2)*8:e<=9?21+(e-4)*20:121+(e-10)*40;
+        const actScore = editorScore + hits300 * 0.8;
+        const score = typeScore + langScore + trendScore + pvScore + actScore;
 
-      supabaseInsert('anomalies', {
-        title: title,
-        wiki: wiki,
-        lang: lang,
-        type: uniq300 >= 3 ? 'res' : 'mul',
-        edits: hits300,
-        editors: uniq300,
-        lang_count: lc,
-        article_type: atype,
-        url: wikiUrl,
-        score: Math.round(score),
-        is_trending: trendPct !== null,
-        trend_pct: trendPct
-      }, 'title,wiki');
-    }).catch(() => {
-      // Fallback — записуємо без деталей
-      supabaseInsert('anomalies', {
-        title, wiki, lang, type: 'mul',
-        edits: hits300, editors: uniq300,
-        lang_count: 0, article_type: '', url: wikiUrl,
-        score: uniq300 * 3 + hits300, is_trending: false, trend_pct: null
-      }, 'title,wiki');
-    });
+        supabaseInsert('anomalies', {
+          title, wiki, lang,
+          type: uniq300 >= 3 ? 'res' : 'mul',
+          edits: hits300,
+          editors: uniq300,
+          lang_count: lc,
+          article_type: atype,
+          url: wikiUrl,
+          score: Math.round(score),
+          is_trending: trendPct !== null,
+          trend_pct: trendPct
+        }, 'title,wiki');
+      }).catch(() => {
+        supabaseInsert('anomalies', {
+          title, wiki, lang, type: 'mul',
+          edits: hits300, editors: uniq300,
+          lang_count: 0, article_type: '', url: wikiUrl,
+          score: uniq300 * 3 + hits300, is_trending: false, trend_pct: null
+        }, 'title,wiki');
+      });
+    }
   }
 
   // ── TELEGRAM: N+ unique editors in 5 min (tier-based) ──
