@@ -2,6 +2,17 @@ const http = require('http');
 const https = require('https');
 
 // ── GDELT AUTO-SIGNAL ──
+// ── ENDPOINT CACHE (5 хв) ──
+const endpointCache = {};
+function getCached(key) {
+  const e = endpointCache[key];
+  if (e && Date.now() - e.ts < 300000) return e.data;
+  return null;
+}
+function setCache(key, data) {
+  endpointCache[key] = { data, ts: Date.now() };
+}
+
 // ── POLYMARKET CROSS-SIGNAL ──
 let polyCache = { items: [], fetchedAt: 0 };
 
@@ -620,6 +631,14 @@ const server = http.createServer((req, res) => {
     const q = params.get('q') || '';
     if (!q) { res.writeHead(400); res.end('{}'); return; }
 
+    // Check cache first
+    const cached = getCached('gdelt:'+q);
+    if (cached) {
+      res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+      res.end(cached);
+      return;
+    }
+
     // Single request — no rate limit issues
     const gdeltUrl = 'https://api.gdeltproject.org/api/v2/doc/doc?query='
       + encodeURIComponent(q)
@@ -640,8 +659,10 @@ const server = http.createServer((req, res) => {
             title: a.title, url: a.url, source: a.domain,
             date: a.seendate, country: a.sourcecountry, lang: a.language
           }));
+          const result = JSON.stringify({ items: articles, avgTone: 0, query: q, fetchedAt: Date.now() });
+          setCache('gdelt:'+q, result);
           res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
-          res.end(JSON.stringify({ items: articles, avgTone: 0, query: q, fetchedAt: Date.now() }));
+          res.end(result);
         } catch(e) {
           res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
           res.end(JSON.stringify({ items: [], avgTone: 0, query: q }));
@@ -688,9 +709,10 @@ const server = http.createServer((req, res) => {
       }).on('error', () => resolve([]));
     });
 
-    Promise.all(feeds.map(fetchFeed)).then(results => {
-      let all = results.flat();
-      // Filter by query if provided
+    // Check RSS base cache (without filter)
+    const rssBase = getCached('rss:base');
+    const doFetch = (baseItems) => {
+      let all = baseItems || [];
       if (q) {
         const words = q.split(/\s+/).filter(w=>w.length>3);
         all = all.filter(it => {
@@ -698,11 +720,20 @@ const server = http.createServer((req, res) => {
           return words.some(w => t.includes(w));
         });
       }
-      // Sort by freshness (keep order as proxy of recency)
       all = all.slice(0, 20);
       res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
       res.end(JSON.stringify({ items: all, query: q, fetchedAt: Date.now() }));
-    });
+    };
+
+    if (rssBase) {
+      doFetch(JSON.parse(rssBase));
+    } else {
+      Promise.all(feeds.map(fetchFeed)).then(results => {
+        const all = results.flat();
+        setCache('rss:base', JSON.stringify(all));
+        doFetch(all);
+      });
+    }
     return;
   }
 
@@ -744,6 +775,12 @@ const server = http.createServer((req, res) => {
   // /ddg endpoint — DuckDuckGo news proxy
   if (req.url.startsWith('/ddg?')) {
     const q = new URL('http://localhost' + req.url).searchParams.get('q') || '';
+    const ddgCached = getCached('ddg:'+q);
+    if (ddgCached) {
+      res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+      res.end(ddgCached);
+      return;
+    }
     https.get({
       hostname: 'api.duckduckgo.com',
       path: '/?q=' + encodeURIComponent(q) + '&format=json&no_html=1&skip_disambig=1',
@@ -765,8 +802,10 @@ const server = http.createServer((req, res) => {
           if (json.AbstractText) {
             items.unshift({ title: json.AbstractText.slice(0,200), url: json.AbstractURL || '#', source: json.AbstractSource || 'DuckDuckGo', date: 'today' });
           }
+          const ddgResult = JSON.stringify({ items });
+          setCache('ddg:'+q, ddgResult);
           res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
-          res.end(JSON.stringify({ items }));
+          res.end(ddgResult);
         } catch(e) {
           res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
           res.end(JSON.stringify({ items: [] }));
@@ -803,8 +842,10 @@ const server = http.createServer((req, res) => {
             source: a.source?.name || 'GNews',
             date: a.publishedAt ? new Date(a.publishedAt).toLocaleString('uk-UA', {day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'}) : ''
           }));
+          const ddgResult = JSON.stringify({ items });
+          setCache('ddg:'+q, ddgResult);
           res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
-          res.end(JSON.stringify({ items }));
+          res.end(ddgResult);
         } catch(e) {
           res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
           res.end(JSON.stringify({ items: [], error: e.message }));
