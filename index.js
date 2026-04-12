@@ -656,6 +656,79 @@ const server = http.createServer((req, res) => {
   }
 
 
+  // ── /rss — агрегований RSS з BBC/AP/Al Jazeera ──
+  if (req.url.startsWith('/rss')) {
+    const params = new URLSearchParams(req.url.split('?')[1]||'');
+    const q = (params.get('q')||'').toLowerCase();
+
+    const feeds = [
+      { name: 'BBC World', url: 'https://feeds.bbci.co.uk/news/world/rss.xml' },
+      { name: 'Al Jazeera', url: 'https://www.aljazeera.com/xml/rss/all.xml' },
+      { name: 'Reuters', url: 'https://feeds.reuters.com/reuters/worldNews' },
+      { name: 'AP News', url: 'https://rsshub.app/apnews/topics/world-news' }
+    ];
+
+    const fetchFeed = (feed) => new Promise((resolve) => {
+      https.get(feed.url, { headers: { 'User-Agent': 'ResonanceProxy/1.0' } }, (r) => {
+        let raw = ''; r.on('data', d => raw += d);
+        r.on('end', () => {
+          try {
+            // Parse RSS titles and links with regex
+            const titles = [...raw.matchAll(/<title>(?:<!\[CDATA\[)?([^<\]]+?)(?:\]\]>)?<\/title>/g)]
+              .map(m=>m[1].trim()).slice(1,11);
+            const links = [...raw.matchAll(/<link>(?!http:\/\/)(https?:\/\/[^<]+)<\/link>/g)]
+              .map(m=>m[1].trim()).slice(0,10);
+            const pubDates = [...raw.matchAll(/<pubDate>([^<]+)<\/pubDate>/g)]
+              .map(m=>m[1].trim()).slice(0,10);
+            const items = titles.map((title,i) => ({
+              title, url: links[i]||'', source: feed.name, date: pubDates[i]||''
+            })).filter(it=>it.title&&it.url);
+            resolve(items);
+          } catch(e) { resolve([]); }
+        });
+      }).on('error', () => resolve([]));
+    });
+
+    Promise.all(feeds.map(fetchFeed)).then(results => {
+      let all = results.flat();
+      // Filter by query if provided
+      if (q) all = all.filter(it => it.title.toLowerCase().includes(q));
+      // Sort by freshness (keep order as proxy of recency)
+      all = all.slice(0, 20);
+      res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+      res.end(JSON.stringify({ items: all, query: q, fetchedAt: Date.now() }));
+    });
+    return;
+  }
+
+  // ── /fng — Fear & Greed Index ──
+  if (req.url === '/fng') {
+    https.get('https://api.alternative.me/fng/?limit=7', { headers: { 'User-Agent': 'ResonanceProxy/1.0' } }, (r) => {
+      let raw = ''; r.on('data', d => raw += d);
+      r.on('end', () => {
+        try {
+          const d = JSON.parse(raw);
+          const current = d.data[0];
+          const history = d.data.slice(0,7).map(x=>({
+            value: parseInt(x.value),
+            classification: x.value_classification,
+            date: new Date(parseInt(x.timestamp)*1000).toISOString().slice(0,10)
+          }));
+          res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+          res.end(JSON.stringify({
+            value: parseInt(current.value),
+            classification: current.value_classification,
+            history, fetchedAt: Date.now()
+          }));
+        } catch(e) {
+          res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+          res.end('{}');
+        }
+      });
+    }).on('error', () => { res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'}); res.end('{}'); });
+    return;
+  }
+
   // /ping endpoint — keepalive
   if (req.url === '/ping') {
     res.writeHead(200, { 'Content-Type': 'text/plain', 'Access-Control-Allow-Origin': '*' });
