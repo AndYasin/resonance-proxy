@@ -2,16 +2,38 @@ const http = require('http');
 const https = require('https');
 
 // ── GDELT AUTO-SIGNAL ──
+// GDELT rate limiter — max 1 req per 6 sec
+let lastGdeltCall = 0;
+const gdeltQueue = [];
+function gdeltRateLimited(url, cb) {
+  gdeltQueue.push({url, cb});
+  processGdeltQueue();
+}
+function processGdeltQueue() {
+  if (!gdeltQueue.length) return;
+  const now = Date.now();
+  const wait = Math.max(0, 6000 - (now - lastGdeltCall));
+  setTimeout(() => {
+    if (!gdeltQueue.length) return;
+    const {url, cb} = gdeltQueue.shift();
+    lastGdeltCall = Date.now();
+    https.get(url, { headers: { 'User-Agent': 'ResonanceProxy/1.0' } }, (r) => {
+      let raw = ''; r.on('data', d => raw += d);
+      r.on('end', () => cb(null, raw));
+    }).on('error', e => cb(e, null));
+    setTimeout(processGdeltQueue, 6100);
+  }, wait);
+}
+
 function fetchGdeltSignal(title, lang, wiki, edits, editors) {
   const url = 'https://api.gdeltproject.org/api/v2/doc/doc?query='
     + encodeURIComponent(title)
-    + '&mode=artlist&maxrecords=5&timespan=1440&sort=tonedesc&format=json';
+    + '&mode=ArtList&maxrecords=5&timespan=1d&sort=HybridRel&format=json';
 
-  https.get(url, { headers: { 'User-Agent': 'ResonanceProxy/1.0' } }, (r) => {
-    let raw = '';
-    r.on('data', d => raw += d);
-    r.on('end', () => {
-      try {
+  gdeltRateLimited(url, (err, raw) => {
+    if (err || !raw) return;
+    try {
+      if (raw.includes('limit requests')) return;
         const data = JSON.parse(raw);
         const articles = data.articles || [];
         if (!articles.length) return;
@@ -47,8 +69,7 @@ function fetchGdeltSignal(title, lang, wiki, edits, editors) {
           );
         }
       } catch(e) {}
-    });
-  }).on('error', () => {});
+  });
 }
 
 // ── SUPABASE ──
@@ -534,30 +555,46 @@ const server = http.createServer((req, res) => {
     const params = new URLSearchParams(req.url.slice(7));
     const q = params.get('q') || '';
     if (!q) { res.writeHead(400); res.end('{}'); return; }
-    const gdeltUrl = 'https://api.gdeltproject.org/api/v2/doc/doc?query='
+    // Fetch articles + tone separately and merge
+    const artUrl = 'https://api.gdeltproject.org/api/v2/doc/doc?query='
       + encodeURIComponent(q)
-      + '&mode=artlist&maxrecords=10&timespan=1440&sort=tonedesc&format=json';
-    https.get(gdeltUrl, { headers: { 'User-Agent': 'ResonanceProxy/1.0' } }, (gr) => {
-      let raw = '';
-      gr.on('data', d => raw += d);
-      gr.on('end', () => {
-        try {
-          const data = JSON.parse(raw);
-          const articles = (data.articles || []).map(a => ({
-            title: a.title, url: a.url, source: a.domain,
-            date: a.seendate, tone: parseFloat(a.tone||0).toFixed(1),
-            country: a.sourcecountry, lang: a.sourcelang
-          }));
-          const tones = articles.map(a=>parseFloat(a.tone)).filter(t=>!isNaN(t));
-          const avgTone = tones.length ? (tones.reduce((a,b)=>a+b,0)/tones.length).toFixed(1) : 0;
-          res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
-          res.end(JSON.stringify({ items: articles, avgTone: parseFloat(avgTone), query: q, fetchedAt: Date.now() }));
-        } catch(e) {
-          res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
-          res.end(JSON.stringify({ items: [], avgTone: 0, query: q }));
-        }
-      });
-    }).on('error', () => { res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'}); res.end(JSON.stringify({items:[],avgTone:0})); });
+      + '&mode=artlist&maxrecords=10&timespan=4320&sort=datedesc&format=json';
+    const toneUrl = 'https://api.gdeltproject.org/api/v2/doc/doc?query='
+      + encodeURIComponent(q)
+      + '&mode=tonechart&timespan=4320&format=json';
+
+    Promise.all([
+      new Promise((resolve) => {
+        https.get(artUrl, { headers: { 'User-Agent': 'ResonanceProxy/1.0' } }, (gr) => {
+          let raw = '';
+          gr.on('data', d => raw += d);
+          gr.on('end', () => { try { resolve(JSON.parse(raw)); } catch(e) { resolve({}); } });
+        }).on('error', () => resolve({}));
+      }),
+      new Promise((resolve) => {
+        https.get(toneUrl, { headers: { 'User-Agent': 'ResonanceProxy/1.0' } }, (gr) => {
+          let raw = '';
+          gr.on('data', d => raw += d);
+          gr.on('end', () => { try { resolve(JSON.parse(raw)); } catch(e) { resolve({}); } });
+        }).on('error', () => resolve({}));
+      })
+    ]).then(([artData, toneData]) => {
+      const articles = (artData.articles || []).map(a => ({
+        title: a.title, url: a.url, source: a.domain,
+        date: a.seendate, tone: a.tone ? parseFloat(a.tone).toFixed(1) : null,
+        country: a.sourcecountry, lang: a.language
+      }));
+      // Get avg tone from tonechart
+      const toneArr = toneData.tonechart || [];
+      const avgTone = toneArr.length
+        ? (toneArr.reduce((s,t) => s + parseFloat(t.avgtone||0), 0) / toneArr.length).toFixed(1)
+        : 0;
+      res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+      res.end(JSON.stringify({ items: articles, avgTone: parseFloat(avgTone), query: q, fetchedAt: Date.now() }));
+    }).catch(() => {
+      res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+      res.end(JSON.stringify({ items: [], avgTone: 0, query: q }));
+    });
     return;
   }
 
