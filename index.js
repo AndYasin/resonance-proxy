@@ -620,107 +620,41 @@ const server = http.createServer((req, res) => {
     const params = new URLSearchParams(req.url.slice(7));
     const q = params.get('q') || '';
     if (!q) { res.writeHead(400); res.end('{}'); return; }
-    // Fetch articles + tone separately and merge
-    const artUrl = 'https://api.gdeltproject.org/api/v2/doc/doc?query='
-      + encodeURIComponent(q)
-      + '&mode=artlist&maxrecords=10&timespan=4320&sort=datedesc&format=json';
-    const toneUrl = 'https://api.gdeltproject.org/api/v2/doc/doc?query='
-      + encodeURIComponent(q)
-      + '&mode=tonechart&timespan=4320&format=json';
 
-    Promise.all([
-      new Promise((resolve) => {
-        https.get(artUrl, { headers: { 'User-Agent': 'ResonanceProxy/1.0' } }, (gr) => {
-          let raw = '';
-          gr.on('data', d => raw += d);
-          gr.on('end', () => { try { resolve(JSON.parse(raw)); } catch(e) { resolve({}); } });
-        }).on('error', () => resolve({}));
-      }),
-      new Promise((resolve) => {
-        https.get(toneUrl, { headers: { 'User-Agent': 'ResonanceProxy/1.0' } }, (gr) => {
-          let raw = '';
-          gr.on('data', d => raw += d);
-          gr.on('end', () => { try { resolve(JSON.parse(raw)); } catch(e) { resolve({}); } });
-        }).on('error', () => resolve({}));
-      })
-    ]).then(([artData, toneData]) => {
-      const articles = (artData.articles || []).map(a => ({
-        title: a.title, url: a.url, source: a.domain,
-        date: a.seendate, tone: a.tone ? parseFloat(a.tone).toFixed(1) : null,
-        country: a.sourcecountry, lang: a.language
-      }));
-      // Get avg tone from tonechart
-      const toneArr = toneData.tonechart || [];
-      const avgTone = toneArr.length
-        ? (toneArr.reduce((s,t) => s + parseFloat(t.avgtone||0), 0) / toneArr.length).toFixed(1)
-        : 0;
-      res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
-      res.end(JSON.stringify({ items: articles, avgTone: parseFloat(avgTone), query: q, fetchedAt: Date.now() }));
-    }).catch(() => {
+    // Single request — no rate limit issues
+    const gdeltUrl = 'https://api.gdeltproject.org/api/v2/doc/doc?query='
+      + encodeURIComponent(q)
+      + '&mode=ArtList&maxrecords=10&timespan=1d&sort=HybridRel&format=json';
+
+    https.get(gdeltUrl, { headers: { 'User-Agent': 'ResonanceProxy/1.0' } }, (gr) => {
+      let raw = '';
+      gr.on('data', d => raw += d);
+      gr.on('end', () => {
+        if (raw.includes('limit requests') || raw.includes('error code')) {
+          res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+          res.end(JSON.stringify({ items: [], avgTone: 0, query: q, rateLimited: true }));
+          return;
+        }
+        try {
+          const data = JSON.parse(raw);
+          const articles = (data.articles || []).map(a => ({
+            title: a.title, url: a.url, source: a.domain,
+            date: a.seendate, country: a.sourcecountry, lang: a.language
+          }));
+          res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+          res.end(JSON.stringify({ items: articles, avgTone: 0, query: q, fetchedAt: Date.now() }));
+        } catch(e) {
+          res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+          res.end(JSON.stringify({ items: [], avgTone: 0, query: q }));
+        }
+      });
+    }).on('error', () => {
       res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
       res.end(JSON.stringify({ items: [], avgTone: 0, query: q }));
     });
     return;
   }
 
-  // ── /polymarket — активні ринки з ймовірностями ──
-  if (req.url.startsWith('/polymarket')) {
-    const params = new URLSearchParams(req.url.split('?')[1]||'');
-    const q = (params.get('q')||'').toLowerCase();
-    const limit = parseInt(params.get('limit')||'200');
-
-    https.get({
-      hostname: 'gamma-api.polymarket.com',
-      path: '/markets?closed=false&limit='+limit+'&order=volumeNum&ascending=false',
-      headers: { 'User-Agent': 'ResonanceProxy/1.0' }
-    }, (pr) => {
-      let raw = '';
-      pr.on('data', d => raw += d);
-      pr.on('end', () => {
-        try {
-          const data = JSON.parse(raw);
-          let markets = data.map(m => {
-            const prices = JSON.parse(m.outcomePrices||'[]');
-            const outcomes = JSON.parse(m.outcomes||'[]');
-            const yesProb = parseFloat(prices[0]||0);
-            return {
-              id: m.id,
-              question: m.question,
-              slug: m.slug,
-              endDate: m.endDate,
-              yesProb: yesProb,
-              yesPrice: Math.round(yesProb*100),
-              volume: Math.round(m.volumeNum||0),
-              liquidity: Math.round(m.liquidityNum||0),
-              outcomes: outcomes,
-              prices: prices,
-              url: 'https://polymarket.com/event/'+m.slug
-            };
-          });
-
-          // Filter by keyword if provided
-          if (q) {
-            markets = markets.filter(m =>
-              m.question.toLowerCase().includes(q)
-            );
-          }
-
-          // Sort by volume
-          markets.sort((a,b) => b.volume - a.volume);
-
-          res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
-          res.end(JSON.stringify({ items: markets.slice(0,50), total: markets.length, fetchedAt: Date.now() }));
-        } catch(e) {
-          res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
-          res.end(JSON.stringify({ items: [], total: 0, error: e.message }));
-        }
-      });
-    }).on('error', () => {
-      res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
-      res.end(JSON.stringify({ items: [], total: 0 }));
-    });
-    return;
-  }
 
   // /ping endpoint — keepalive
   if (req.url === '/ping') {
