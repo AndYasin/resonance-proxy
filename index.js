@@ -458,10 +458,9 @@ async function checkAnomaly(title, wiki, user, isBot) {
     ]);
     const { type, langCount } = info;
 
-    // ── GDELT auto-enrich ──
-    fetchGdeltSignal(title, lang, wiki, hits300, uniq300);
     // ── Polymarket cross-signal ──
     fetchPolymarketSignal(title, uniq300);
+    // GDELT auto-enrich вимкнено — зберігаємо квоту для AI модалки
 
     // ── Записуємо всі аномалії в Supabase ──
     supabaseInsert('anomalies', {
@@ -692,7 +691,13 @@ const server = http.createServer((req, res) => {
     Promise.all(feeds.map(fetchFeed)).then(results => {
       let all = results.flat();
       // Filter by query if provided
-      if (q) all = all.filter(it => it.title.toLowerCase().includes(q));
+      if (q) {
+        const words = q.split(/\s+/).filter(w=>w.length>3);
+        all = all.filter(it => {
+          const t = it.title.toLowerCase();
+          return words.some(w => t.includes(w));
+        });
+      }
       // Sort by freshness (keep order as proxy of recency)
       all = all.slice(0, 20);
       res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
