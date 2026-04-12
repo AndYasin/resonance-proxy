@@ -487,7 +487,10 @@ async function checkAnomaly(title, wiki, user, isBot) {
       const langScore = Math.min(lc * 0.4, 30);
       const trendScore = trendPct ? Math.min(trendPct / 20, 20) : 0;
       const pvScore = pvRatio ? Math.min((pvRatio - 1) * 3, 15) : 0;
-      const actScore = uniq300 * 2.5 + hits300 * 0.8;
+      // Експоненційний burst score
+      const e = uniq300;
+      const editorScore = e<=2?e*2.5:e<=4?5+(e-2)*8:e<=9?21+(e-4)*20:121+(e-10)*40;
+      const actScore = editorScore + hits300 * 0.8;
       const score = typeScore + langScore + trendScore + pvScore + actScore;
 
       supabaseInsert('anomalies', {
