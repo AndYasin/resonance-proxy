@@ -1721,8 +1721,10 @@ async function fetchSecFilings(forms) {
               score: meta.score,
               state: s.biz_states?.[0] || '',
               date: s.file_date,
-              url: 'https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=' +
-                   (s.file_num?.[0] || '') + '&type=' + encodeURIComponent(form),
+              url: 'https://www.sec.gov/cgi-bin/browse-edgar?company=' +
+                   encodeURIComponent(company.replace(/[,.]/g,'').trim()) +
+                   '&CIK=&type=' + encodeURIComponent(form) +
+                   '&dateb=&owner=include&count=10&search_text=&action=getcompany',
               itemTypes
             });
           }
