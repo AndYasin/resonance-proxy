@@ -1306,45 +1306,79 @@ function connectGlobalUpstream() {
 
 let predCache = { items: [], fetchedAt: 0 };
 
-// ── METACULUS ──
-async function fetchMetaculus() {
+// ── POLYMARKET (замість Metaculus який закрив API) ──
+async function fetchPolymarketDirect() {
   return new Promise((resolve) => {
     https.get({
-      hostname: 'www.metaculus.com',
-      path: '/api2/questions/?status=open&order_by=-activity&limit=50&format=json',
-      headers: { 'User-Agent': 'ResonanceBot/1.0', 'Accept': 'application/json' }
+      hostname: 'gamma-api.polymarket.com',
+      path: '/markets?closed=false&limit=100&order=volumeNum&ascending=false',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+        'Accept': 'application/json',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Origin': 'https://polymarket.com',
+        'Referer': 'https://polymarket.com/'
+      }
     }, (res) => {
       let raw = ''; res.on('data', d => raw += d);
       res.on('end', () => {
+        // CF повертає HTML якщо блокує
+        if (raw.startsWith('<!DOCTYPE') || raw.startsWith('<html')) {
+          console.log('Polymarket CF blocked, using cache');
+          resolve(polyCache.items.slice(0,50).map(m => ({
+            source: 'polymarket',
+            id: 'pm_' + (m.id||''),
+            title: m.question || '',
+            probability: (() => { try { return parseFloat(JSON.parse(m.outcomePrices||'[]')[0]||0); } catch(e) { return null; } })(),
+            volume: Math.round((m.volumeNum||0)/1000),
+            url: 'https://polymarket.com/event/' + (m.slug||''),
+            categories: '',
+            activity: m.volumeNum || 0,
+            closeTime: m.endDateIso || null
+          })).filter(q => q.title));
+          return;
+        }
         try {
           const data = JSON.parse(raw);
-          const items = (data.results || []).map(q => ({
-            source: 'metaculus',
-            id: 'mc_' + q.id,
-            title: q.title || '',
-            probability: q.community_prediction?.full?.q2 || null,
-            volume: q.number_of_forecasters || 0,
-            url: 'https://www.metaculus.com' + (q.page_url || ''),
-            categories: (q.categories || []).map(c => c.name || '').join(','),
-            activity: q.activity || 0,
-            closeTime: q.close_time || null
-          })).filter(q => q.title);
-          console.log('Metaculus:', items.length, 'questions');
+          const items = (Array.isArray(data) ? data : []).map(m => {
+            let prob = null;
+            try { prob = parseFloat(JSON.parse(m.outcomePrices||'[]')[0]||0); } catch(e) {}
+            return {
+              source: 'polymarket',
+              id: 'pm_' + (m.id||''),
+              title: m.question || '',
+              probability: prob,
+              volume: Math.round((m.volumeNum||0)/1000),
+              url: 'https://polymarket.com/event/' + (m.slug||''),
+              categories: '',
+              activity: m.volumeNum || 0,
+              closeTime: m.endDateIso || null
+            };
+          }).filter(q => q.title);
+          if (items.length) polyCache = { items: data, fetchedAt: Date.now() };
+          console.log('Polymarket direct:', items.length, 'markets');
           resolve(items);
-        } catch(e) { console.log('Metaculus error:', e.message); resolve([]); }
+        } catch(e) { console.log('Polymarket parse error:', e.message); resolve([]); }
       });
-    }).on('error', e => { console.log('Metaculus fetch error:', e.message); resolve([]); });
+    }).on('error', e => { console.log('Polymarket direct error:', e.message); resolve([]); });
   });
 }
 
 // ── MANIFOLD ──
 async function fetchManifold() {
   return new Promise((resolve) => {
+    const doGet = (hostname, path) => {
     https.get({
-      hostname: 'manifold.markets',
-      path: '/api/v0/markets?limit=50&sort=score',
-      headers: { 'User-Agent': 'ResonanceBot/1.0', 'Accept': 'application/json' }
+      hostname,
+      path,
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ResonanceBot/1.0)', 'Accept': 'application/json' }
     }, (res) => {
+      // Follow redirect
+      if (res.statusCode === 301 || res.statusCode === 302) {
+        const loc = res.headers.location || '';
+        const m = loc.match(/https?:\/\/([^\/]+)(.*)/);
+        if (m) { doGet(m[1], m[2]); return; }
+      }
       let raw = ''; res.on('data', d => raw += d);
       res.on('end', () => {
         try {
@@ -1365,6 +1399,8 @@ async function fetchManifold() {
         } catch(e) { console.log('Manifold error:', e.message); resolve([]); }
       });
     }).on('error', e => { console.log('Manifold fetch error:', e.message); resolve([]); });
+    }; // end doGet
+    doGet('manifold.markets', '/api/v0/markets?limit=50&sort=last-bet-time');
   });
 }
 
@@ -1413,7 +1449,7 @@ async function fetchAllPredictions() {
   }
 
   const [metaculus, manifold, predictit] = await Promise.all([
-    fetchMetaculus(),
+    fetchPolymarketDirect(),
     fetchManifold(),
     fetchPredictIt()
   ]);
