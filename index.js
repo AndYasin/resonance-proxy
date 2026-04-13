@@ -536,7 +536,10 @@ async function checkAnomaly(title, wiki, user, isBot, meta={}) {
   }
   const w = anomWindow[key];
   w.lastSeen = now;
+  const isMinor = meta?.isMinor || false;
   w.ts60.push(now); w.ts300.push(now);
+  if (isMinor) w.minorCount = (w.minorCount||0)+1;
+  else w.nonMinorCount = (w.nonMinorCount||0)+1;
   // Не рахуємо ботів і тимчасові акаунти як унікальних редакторів
   if (user && !looksLikeBot(user, isBot)) { w.users60.add(user); w.users300.add(user); }
   w.ts60  = w.ts60.filter(t => now - t < 60000);
@@ -578,7 +581,9 @@ async function checkAnomaly(title, wiki, user, isBot, meta={}) {
           t.article.toLowerCase() === title.toLowerCase()) : null;
         const trendPct = trendItem ? trendItem.delta : null;
 
-        const typeScore = typeWeights[atype.replace(/[^а-яА-ЯіІїЇєЄa-zA-Z]/g,'')] || 0;
+        const minorPenalty = (w.nonMinorCount||0) > 0 ? 1.0 : 0.4; // якщо всі minor — знижуємо
+        const sectionBonus = (meta?.section||'').toLowerCase().match(/death|killed|died|murder/) ? 30 : 0;
+        const typeScore = (typeWeights[atype.replace(/[^а-яА-ЯіІїЇєЄa-zA-Z]/g,'')] || 0) * minorPenalty;
         const langScore = Math.min(lc * 0.4, 30);
         const trendScore = trendPct ? Math.min(trendPct / 20, 20) : 0;
         const pvScore = pvRatio ? Math.min((pvRatio - 1) * 3, 15) : 0;
@@ -594,7 +599,7 @@ async function checkAnomaly(title, wiki, user, isBot, meta={}) {
         const commentBonus = Math.max(0, commentParsed.signal);
         const deltaBonus = meta.deltaBytes > 5000 ? 20 : meta.deltaBytes < -2000 ? 15 : 0;
         const ageBonus = getArticleAgeBonus(title, meta.isNewArticle||false);
-        const score = typeScore + langScore + trendScore + pvScore + actScore + susScore + resonanceBonus + burstBonus + commentBonus + deltaBonus + ageBonus;
+        const score = typeScore + langScore + trendScore + pvScore + actScore + susScore + resonanceBonus + burstBonus + commentBonus + deltaBonus + ageBonus + sectionBonus;
         // Зберігаємо для наступних правок
         if (!w.lastComment && meta.comment) w.lastComment = meta.comment;
         if (commentParsed.keywords.length) w.commentKeywords = commentParsed.keywords;
@@ -613,7 +618,9 @@ async function checkAnomaly(title, wiki, user, isBot, meta={}) {
           comment_keywords: commentParsed.keywords.join(',') || null,
           delta_bytes: meta.deltaBytes || 0,
           is_new_article: meta.isNewArticle || false,
-          sentiment: commentParsed.sentiment
+          sentiment: commentParsed.sentiment,
+          section: meta?.section || null,
+          is_minor: isMinor
         }, 'title,wiki');
 
         // PAI розраховується вручну через Spider → /api/pai
@@ -1236,7 +1243,9 @@ function connectGlobalUpstream() {
               const deltaBytes = (data.length?.new||0) - (data.length?.old||0);
               const comment = data.comment || data.parsedcomment || '';
               const isNewArticle = data.type === 'new' || (data.revision?.old === 0);
-              const meta = { deltaBytes, comment, isNewArticle };
+              const isMinor = !!data.minor;
+              const section = comment.match(/\/\* ?([^*]+?) ?\*\//)?.[1] || '';
+              const meta = { deltaBytes, comment, isNewArticle, isMinor, section };
               checkAnomaly(data.title, data.wiki, data.user, data.bot, meta);
               const msg = 'data: ' + JSON.stringify({
                 title: data.title, wiki: data.wiki,
