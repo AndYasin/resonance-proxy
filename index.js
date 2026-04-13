@@ -1367,40 +1367,46 @@ async function fetchPolymarketDirect() {
 // ── MANIFOLD ──
 async function fetchManifold() {
   return new Promise((resolve) => {
-    const doGet = (hostname, path) => {
-    https.get({
-      hostname,
-      path,
-      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ResonanceBot/1.0)', 'Accept': 'application/json' }
-    }, (res) => {
-      // Follow redirect
-      if (res.statusCode === 301 || res.statusCode === 302) {
-        const loc = res.headers.location || '';
-        const m = loc.match(/https?:\/\/([^\/]+)(.*)/);
-        if (m) { doGet(m[1], m[2]); return; }
-      }
-      let raw = ''; res.on('data', d => raw += d);
-      res.on('end', () => {
-        try {
-          const data = JSON.parse(raw);
-          const items = (Array.isArray(data) ? data : []).map(q => ({
-            source: 'manifold',
-            id: 'mf_' + q.id,
-            title: q.question || '',
-            probability: q.probability || null,
-            volume: Math.round(q.volume || 0),
-            url: q.url || '',
-            categories: (q.tags || []).join(','),
-            activity: q.volume || 0,
-            closeTime: q.closeTime ? new Date(q.closeTime).toISOString() : null
-          })).filter(q => q.title);
-          console.log('Manifold:', items.length, 'markets');
-          resolve(items);
-        } catch(e) { console.log('Manifold error:', e.message); resolve([]); }
+    const makeReq = (options) => {
+      const req = https.get(options, (res) => {
+        if (res.statusCode === 301 || res.statusCode === 302) {
+          const loc = res.headers.location || '';
+          res.resume();
+          if (loc.startsWith('http')) {
+            const u = new URL(loc);
+            makeReq({ hostname: u.hostname, path: u.pathname + u.search, headers: options.headers });
+          }
+          return;
+        }
+        let raw = ''; res.on('data', d => raw += d);
+        res.on('end', () => {
+          try {
+            const data = JSON.parse(raw);
+            if (!Array.isArray(data)) { console.log('Manifold not array:', typeof data); resolve([]); return; }
+            const items = data.map(q => ({
+              source: 'manifold',
+              id: 'mf_' + q.id,
+              title: q.question || '',
+              probability: q.probability || null,
+              volume: Math.round(q.volume || 0),
+              url: q.url || 'https://manifold.markets/' + q.id,
+              categories: (q.tags || []).join(','),
+              activity: q.volume || 0,
+              closeTime: q.closeTime ? new Date(q.closeTime).toISOString() : null
+            })).filter(q => q.title);
+            console.log('Manifold:', items.length, 'markets');
+            resolve(items);
+          } catch(e) { console.log('Manifold parse error:', e.message, raw.slice(0,100)); resolve([]); }
+        });
       });
-    }).on('error', e => { console.log('Manifold fetch error:', e.message); resolve([]); });
-    }; // end doGet
-    doGet('manifold.markets', '/api/v0/markets?limit=50&sort=last-bet-time');
+      req.on('error', e => { console.log('Manifold error:', e.message); resolve([]); });
+      req.setTimeout(8000, () => { req.destroy(); resolve([]); });
+    };
+    makeReq({
+      hostname: 'api.manifold.markets',
+      path: '/v0/markets?limit=50&sort=last-bet-time',
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ResonanceBot/1.0)', 'Accept': 'application/json' }
+    });
   });
 }
 
