@@ -1111,6 +1111,20 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // /sec endpoint — SEC EDGAR filings
+  if (req.url.startsWith('/sec')) {
+    const params = new URLSearchParams(req.url.split('?')[1]||'');
+    const forms = params.get('forms') || 'S-1,S-1/A,8-K,SC 13D,425,DEFM14A';
+    fetchSecFilings(forms).then(items => {
+      res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+      res.end(JSON.stringify({ items, fetchedAt: secCache.fetchedAt, count: items.length }));
+    }).catch(() => {
+      res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+      res.end(JSON.stringify({ items: [], count: 0 }));
+    });
+    return;
+  }
+
   // /ping endpoint — keepalive
   if (req.url === '/ping') {
     res.writeHead(200, { 'Content-Type': 'text/plain', 'Access-Control-Allow-Origin': '*' });
@@ -1609,6 +1623,143 @@ function calcNewScore({ editors, langCount, trendPct, deltaBytes, keywords, bonu
   
   return Math.round(score);
 }
+
+// Додати в index.js Railway — SEC EDGAR моніторинг
+
+// ════════════════════════════════════════
+// SEC EDGAR — S-1 / 8-K / 13D моніторинг
+// ════════════════════════════════════════
+
+let secCache = { items: [], fetchedAt: 0 };
+
+const SEC_FORMS = {
+  'S-1':   { label: 'IPO',        emoji: '🚀', score: 80 },
+  'S-1/A': { label: 'IPO амend',  emoji: '🚀', score: 40 },
+  '8-K':   { label: 'Подія',      emoji: '⚡', score: 60 },
+  'SC 13D':{ label: 'Акціонер',   emoji: '🎯', score: 50 },
+  'SC 13G':{ label: 'Акціонер',   emoji: '🎯', score: 30 },
+  '425':   { label: 'M&A',        emoji: '💼', score: 70 },
+  'DEFM14A':{ label: 'Merger',    emoji: '💼', score: 75 },
+};
+
+async function fetchSecFilings(forms) {
+  const now = Date.now();
+  if (now - secCache.fetchedAt < 300000 && secCache.items.length) return secCache.items;
+
+  const today = new Date().toISOString().slice(0, 10);
+  const yesterday = new Date(now - 86400000).toISOString().slice(0, 10);
+  const formList = forms || Object.keys(SEC_FORMS).join(',');
+
+  return new Promise((resolve) => {
+    const path = '/LATEST/search-index?forms=' +
+      encodeURIComponent(formList) +
+      '&dateRange=custom&startdt=' + yesterday +
+      '&enddt=' + today +
+      '&_source=file_date,display_names,period_ending,file_num,root_forms,biz_states&from=0&size=50';
+
+    https.get({
+      hostname: 'efts.sec.gov',
+      path,
+      headers: { 'User-Agent': 'ResonanceBot/1.0 contact@resonance.app', 'Accept': 'application/json' }
+    }, (res) => {
+      let raw = ''; res.on('data', d => raw += d);
+      res.on('end', () => {
+        try {
+          const data = JSON.parse(raw);
+          const seen = new Set();
+          const items = [];
+
+          for (const hit of (data.hits?.hits || [])) {
+            const s = hit._source;
+            const nameRaw = s.display_names?.[0] || '';
+            const company = nameRaw.split('(')[0].trim();
+            const tickerM = nameRaw.match(/\(([A-Z0-9]{1,5})\)/);
+            const ticker = tickerM ? tickerM[1] : '';
+            const form = s.root_forms?.[0] || '';
+            const key = company + ':' + form;
+
+            if (seen.has(key)) continue;
+            seen.add(key);
+
+            const meta = SEC_FORMS[form] || { label: form, emoji: '📄', score: 20 };
+
+            items.push({
+              company: company.slice(0, 60),
+              ticker,
+              form,
+              label: meta.label,
+              emoji: meta.emoji,
+              score: meta.score,
+              state: s.biz_states?.[0] || '',
+              date: s.file_date,
+              url: 'https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=' +
+                   (s.file_num?.[0] || '') + '&type=' + encodeURIComponent(form)
+            });
+          }
+
+          // Сортуємо за score (важливість форми)
+          items.sort((a, b) => b.score - a.score);
+          secCache = { items, fetchedAt: now };
+          console.log('SEC updated:', items.length, 'filings, forms:', [...new Set(items.map(i => i.form))].join(','));
+          resolve(items);
+        } catch(e) {
+          console.log('SEC parse error:', e.message);
+          resolve([]);
+        }
+      });
+    }).on('error', e => { console.log('SEC fetch error:', e.message); resolve([]); });
+  });
+}
+
+// Cross-signal: SEC filing + Wikipedia burst
+async function checkSecWikiSignal(secItem) {
+  if (!secItem.company) return;
+  const words = secItem.company.toLowerCase().split(/\s+/).filter(w => w.length > 3 && !['inc','corp','ltd','llc','the','and'].includes(w));
+  
+  // Шукаємо в anomWindow чи є Wikipedia активність по цій компанії
+  for (const [key, w] of Object.entries(anomWindow)) {
+    const wikiTitle = key.split(':').slice(1).join(':').toLowerCase();
+    const match = words.some(word => wikiTitle.includes(word));
+    if (!match) continue;
+    if (w.ts300.length < 2) continue;
+
+    console.log('SEC+WIKI signal:', secItem.company, '->', wikiTitle, '| form:', secItem.form);
+    supabaseInsert('cross_signals', {
+      type: 'SEC+WIKI',
+      title: secItem.company,
+      detail: secItem.emoji + ' ' + secItem.form + ' · ' + secItem.label + ' · wiki: ' + wikiTitle,
+      wiki_title: wikiTitle,
+      crypto_symbol: null,
+      score: secItem.score * 2,
+      source_url: secItem.url
+    });
+
+    if (TELEGRAM_TOKEN) {
+      sendTelegram(
+        '📋 <b>SEC+WIKI Signal: ' + secItem.company + '</b>\n\n' +
+        secItem.emoji + ' Form <b>' + secItem.form + '</b> (' + secItem.label + ')\n' +
+        '📖 Wikipedia активна: ' + wikiTitle + '\n' +
+        '🔗 <a href="' + secItem.url + '">SEC filing</a>'
+      );
+    }
+  }
+}
+
+// Оновлюємо SEC кожні 15 хв і перевіряємо cross-signals
+async function pollSec() {
+  try {
+    const items = await fetchSecFilings('S-1,S-1/A,8-K,SC 13D,425,DEFM14A');
+    // Перевіряємо cross-signals з активними Wikipedia аномаліями
+    for (const item of items.filter(i => i.score >= 60)) {
+      await checkSecWikiSignal(item);
+    }
+  } catch(e) {
+    console.log('SEC poll error:', e.message);
+  }
+}
+
+pollSec();
+setInterval(pollSec, 900000); // кожні 15 хв
 
 connectGlobalUpstream();
 
