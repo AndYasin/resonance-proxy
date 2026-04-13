@@ -623,6 +623,8 @@ async function checkAnomaly(title, wiki, user, isBot, meta={}) {
           is_minor: isMinor
         }, 'title,wiki');
 
+        // Prediction markets cross-signal
+        checkPredictionSignals(title, wiki, uniq300, Math.round(score));
         // PAI розраховується вручну через Spider → /api/pai
 
       }).catch(() => {
@@ -1084,6 +1086,22 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // /predictions endpoint
+  if (req.url === '/predictions') {
+    res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+    res.end(JSON.stringify({
+      items: predCache.items,
+      fetchedAt: predCache.fetchedAt,
+      count: predCache.items.length,
+      bySource: {
+        metaculus: predCache.items.filter(i=>i.source==='metaculus').length,
+        manifold: predCache.items.filter(i=>i.source==='manifold').length,
+        predictit: predCache.items.filter(i=>i.source==='predictit').length,
+      }
+    }));
+    return;
+  }
+
   // /ping endpoint — keepalive
   if (req.url === '/ping') {
     res.writeHead(200, { 'Content-Type': 'text/plain', 'Access-Control-Allow-Origin': '*' });
@@ -1280,6 +1298,207 @@ function connectGlobalUpstream() {
 }
 
 // Start global Wikipedia upstream immediately on launch
+
+// ════════════════════════════════════════
+// PREDICTION MARKETS — Рівень 1
+// Metaculus + Manifold + PredictIt
+// ════════════════════════════════════════
+
+let predCache = { items: [], fetchedAt: 0 };
+
+// ── METACULUS ──
+async function fetchMetaculus() {
+  return new Promise((resolve) => {
+    https.get({
+      hostname: 'www.metaculus.com',
+      path: '/api2/questions/?status=open&order_by=-activity&limit=50&format=json',
+      headers: { 'User-Agent': 'ResonanceBot/1.0', 'Accept': 'application/json' }
+    }, (res) => {
+      let raw = ''; res.on('data', d => raw += d);
+      res.on('end', () => {
+        try {
+          const data = JSON.parse(raw);
+          const items = (data.results || []).map(q => ({
+            source: 'metaculus',
+            id: 'mc_' + q.id,
+            title: q.title || '',
+            probability: q.community_prediction?.full?.q2 || null,
+            volume: q.number_of_forecasters || 0,
+            url: 'https://www.metaculus.com' + (q.page_url || ''),
+            categories: (q.categories || []).map(c => c.name || '').join(','),
+            activity: q.activity || 0,
+            closeTime: q.close_time || null
+          })).filter(q => q.title);
+          console.log('Metaculus:', items.length, 'questions');
+          resolve(items);
+        } catch(e) { console.log('Metaculus error:', e.message); resolve([]); }
+      });
+    }).on('error', e => { console.log('Metaculus fetch error:', e.message); resolve([]); });
+  });
+}
+
+// ── MANIFOLD ──
+async function fetchManifold() {
+  return new Promise((resolve) => {
+    https.get({
+      hostname: 'manifold.markets',
+      path: '/api/v0/markets?limit=50&sort=score',
+      headers: { 'User-Agent': 'ResonanceBot/1.0', 'Accept': 'application/json' }
+    }, (res) => {
+      let raw = ''; res.on('data', d => raw += d);
+      res.on('end', () => {
+        try {
+          const data = JSON.parse(raw);
+          const items = (Array.isArray(data) ? data : []).map(q => ({
+            source: 'manifold',
+            id: 'mf_' + q.id,
+            title: q.question || '',
+            probability: q.probability || null,
+            volume: Math.round(q.volume || 0),
+            url: q.url || '',
+            categories: (q.tags || []).join(','),
+            activity: q.volume || 0,
+            closeTime: q.closeTime ? new Date(q.closeTime).toISOString() : null
+          })).filter(q => q.title);
+          console.log('Manifold:', items.length, 'markets');
+          resolve(items);
+        } catch(e) { console.log('Manifold error:', e.message); resolve([]); }
+      });
+    }).on('error', e => { console.log('Manifold fetch error:', e.message); resolve([]); });
+  });
+}
+
+// ── PREDICTIT ──
+async function fetchPredictIt() {
+  return new Promise((resolve) => {
+    https.get({
+      hostname: 'www.predictit.org',
+      path: '/api/marketdata/all/',
+      headers: { 'User-Agent': 'ResonanceBot/1.0', 'Accept': 'application/json' }
+    }, (res) => {
+      let raw = ''; res.on('data', d => raw += d);
+      res.on('end', () => {
+        try {
+          const data = JSON.parse(raw);
+          const items = (data.markets || []).map(m => {
+            // Беремо контракт з найвищим обсягом
+            const contracts = m.contracts || [];
+            const top = contracts.sort((a,b) => (b.volume||0)-(a.volume||0))[0];
+            const prob = top ? (top.lastTradePrice || top.bestYesPrice || null) : null;
+            return {
+              source: 'predictit',
+              id: 'pi_' + m.id,
+              title: m.name || '',
+              probability: prob,
+              volume: contracts.reduce((s,c) => s+(c.volume||0), 0),
+              url: m.url || 'https://www.predictit.org/markets/detail/' + m.id,
+              categories: '',
+              activity: m.dateEndKnown ? 1 : 0,
+              closeTime: m.timeStamp || null
+            };
+          }).filter(q => q.title);
+          console.log('PredictIt:', items.length, 'markets');
+          resolve(items);
+        } catch(e) { console.log('PredictIt error:', e.message); resolve([]); }
+      });
+    }).on('error', e => { console.log('PredictIt fetch error:', e.message); resolve([]); });
+  });
+}
+
+// ── АГРЕГАТОР ──
+async function fetchAllPredictions() {
+  const now = Date.now();
+  if (now - predCache.fetchedAt < 600000 && predCache.items.length) {
+    return predCache.items;
+  }
+
+  const [metaculus, manifold, predictit] = await Promise.all([
+    fetchMetaculus(),
+    fetchManifold(),
+    fetchPredictIt()
+  ]);
+
+  const all = [...metaculus, ...manifold, ...predictit];
+  predCache = { items: all, fetchedAt: now };
+  console.log('Predictions total:', all.length);
+  return all;
+}
+
+// ── KEYWORD MATCH ──
+function matchPrediction(wikiTitle, predictions) {
+  const words = wikiTitle.toLowerCase()
+    .split(/[\s,.-]+/)
+    .filter(w => w.length > 3);
+
+  return predictions
+    .filter(p => {
+      const t = p.title.toLowerCase();
+      const matchCount = words.filter(w => t.includes(w)).length;
+      // Мінімум 2 слова або 1 довге (> 6 символів)
+      return matchCount >= 2 || words.some(w => w.length > 6 && t.includes(w));
+    })
+    .map(p => {
+      const t = p.title.toLowerCase();
+      const matchCount = words.filter(w => t.includes(w)).length;
+      const correlation = Math.min(matchCount / words.length, 1);
+      return { ...p, correlation };
+    })
+    .sort((a,b) => b.correlation - a.correlation)
+    .slice(0, 3);
+}
+
+// ── CROSS SIGNAL GENERATOR ──
+async function checkPredictionSignals(title, wiki, editors, score) {
+  if (editors < 2) return; // тільки для підтверджених аномалій
+
+  try {
+    const predictions = await fetchAllPredictions();
+    const matches = matchPrediction(title, predictions);
+
+    for (const match of matches) {
+      const prob = match.probability !== null ? Math.round(match.probability * 100) : null;
+      const detail = [
+        prob !== null ? 'YES:' + prob + '%' : '',
+        match.volume > 0 ? 'vol:' + (match.volume > 1000 ? Math.round(match.volume/1000)+'K' : match.volume) : '',
+        match.source.toUpperCase(),
+        'corr:' + Math.round(match.correlation*100) + '%'
+      ].filter(Boolean).join(' · ');
+
+      const crossScore = Math.round(score * match.correlation * (prob ? prob/100 : 0.5));
+
+      console.log('Prediction match:', title, '->', match.title.slice(0,60), '| prob:', prob, '| score:', crossScore);
+
+      supabaseInsert('cross_signals', {
+        type: 'WIKI+PREDICT',
+        title: title,
+        detail: detail + ' · ' + match.title.slice(0, 80),
+        wiki_title: title,
+        crypto_symbol: null,
+        score: crossScore,
+        source_url: match.url
+      });
+
+      // Telegram якщо сильний сигнал
+      if (crossScore > 100 && editors >= 3 && TELEGRAM_TOKEN) {
+        const emoji = prob > 70 ? '🟢' : prob > 40 ? '🟡' : '🔴';
+        sendTelegram(
+          emoji + ' <b>Prediction Signal: ' + title + '</b>\n\n' +
+          '📊 ' + match.source.toUpperCase() + ': ' + match.title.slice(0,80) + '\n' +
+          (prob !== null ? '💰 Ймовірність: <b>' + prob + '%</b>\n' : '') +
+          '📈 Обсяг: ' + match.volume + ' · Cross score: ' + crossScore + '\n' +
+          '🔗 <a href="' + match.url + '">відкрити ринок</a>'
+        );
+      }
+    }
+  } catch(e) {
+    console.log('Prediction signal error:', e.message);
+  }
+}
+
+// Оновлюємо prediction cache кожні 10 хв
+fetchAllPredictions();
+setInterval(fetchAllPredictions, 600000);
+
 connectGlobalUpstream();
 
 server.listen(process.env.PORT || 3000, '0.0.0.0', () => {
