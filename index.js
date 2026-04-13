@@ -912,6 +912,72 @@ const server = http.createServer((req, res) => {
   }
 
   // ── /fng — Fear & Greed Index ──
+  // ── /markets — VIX, Gold, Oil, DXY, BTC Dominance ──
+  if (req.url === '/markets') {
+    const cached = getCached('markets');
+    if (cached) {
+      res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+      res.end(cached);
+      return;
+    }
+
+    const symbols = [
+      { key: 'vix',  symbol: '%5EVIX',    name: 'VIX',   unit: '' },
+      { key: 'gold', symbol: 'GC%3DF',    name: 'Gold',  unit: '$' },
+      { key: 'oil',  symbol: 'CL%3DF',    name: 'Oil',   unit: '$' },
+      { key: 'dxy',  symbol: 'DX-Y.NYB',  name: 'DXY',   unit: '' },
+    ];
+
+    const fetchSymbol = (sym) => new Promise((resolve) => {
+      https.get({
+        hostname: 'query1.finance.yahoo.com',
+        path: '/v8/finance/chart/' + sym.symbol + '?interval=1d&range=5d',
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ResonanceBot/1.0)' }
+      }, (r) => {
+        let raw = ''; r.on('data', d => raw += d);
+        r.on('end', () => {
+          try {
+            const data = JSON.parse(raw);
+            const result = data.chart?.result?.[0];
+            if (!result) return resolve(null);
+            const closes = result.indicators?.quote?.[0]?.close || [];
+            const current = closes.filter(Boolean).pop();
+            const prev = closes.filter(Boolean).slice(-2)[0];
+            const change = prev ? +((current - prev) / prev * 100).toFixed(2) : 0;
+            resolve({ key: sym.key, name: sym.name, value: +current.toFixed(2), change, unit: sym.unit });
+          } catch(e) { resolve(null); }
+        });
+      }).on('error', () => resolve(null));
+    });
+
+    // BTC Dominance від CoinGecko
+    const fetchBtcDom = () => new Promise((resolve) => {
+      https.get({
+        hostname: 'api.coingecko.com',
+        path: '/api/v3/global',
+        headers: { 'User-Agent': 'ResonanceBot/1.0' }
+      }, (r) => {
+        let raw = ''; r.on('data', d => raw += d);
+        r.on('end', () => {
+          try {
+            const data = JSON.parse(raw);
+            const dom = data.data?.market_cap_percentage?.btc;
+            resolve(dom ? { key: 'btcdom', name: 'BTC Dom', value: +dom.toFixed(1), change: 0, unit: '%' } : null);
+          } catch(e) { resolve(null); }
+        });
+      }).on('error', () => resolve(null));
+    });
+
+    Promise.all([...symbols.map(fetchSymbol), fetchBtcDom()]).then(results => {
+      const items = results.filter(Boolean);
+      const result = JSON.stringify({ items, fetchedAt: Date.now() });
+      setCache('markets', result);
+      res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+      res.end(result);
+    });
+    return;
+  }
+
   if (req.url === '/fng') {
     https.get('https://api.alternative.me/fng/?limit=7', { headers: { 'User-Agent': 'ResonanceProxy/1.0' } }, (r) => {
       let raw = ''; r.on('data', d => raw += d);
