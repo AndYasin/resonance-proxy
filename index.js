@@ -539,6 +539,8 @@ async function checkAnomaly(title, wiki, user, isBot, meta={}) {
   const isMinor = meta?.isMinor || false;
   w.ts60.push(now); w.ts300.push(now);
   // Збираємо коментарі і delta bytes
+  if (!w.comments) w.comments = [];
+  if (!w.deltaBytes) w.deltaBytes = 0;
   if (typeof comment === 'string' && comment) w.comments.push(comment.toLowerCase().slice(0,100));
   if (typeof deltaBytes === 'number') w.deltaBytes += deltaBytes;
   if (w.comments.length > 50) w.comments = w.comments.slice(-50);
@@ -752,13 +754,16 @@ setInterval(() => {
 // ── HTTP SERVER ──
 const server = http.createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', '*');
+  res.setHeader('Access-Control-Max-Age', '86400');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', '*');
-  if (req.method === 'OPTIONS') { res.writeHead(200); res.end(); return; }
+  if (req.method === 'OPTIONS') { res.writeHead(200, {'Access-Control-Allow-Origin':'*','Access-Control-Allow-Methods':'GET,POST,OPTIONS','Access-Control-Allow-Headers':'*','Access-Control-Max-Age':'86400'}); res.end(); return; }
 
   // /trending endpoint
   if (req.url === '/trending') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
     res.end(JSON.stringify({ items: trendingCache.items, fetchedAt: trendingCache.fetchedAt, count: trendingCache.items.length }));
     return;
   }
