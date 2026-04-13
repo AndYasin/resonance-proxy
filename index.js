@@ -1632,6 +1632,18 @@ function calcNewScore({ editors, langCount, trendPct, deltaBytes, keywords, bonu
 
 let secCache = { items: [], fetchedAt: 0 };
 
+const EIGHT_K_ITEMS = {
+  '1.01': { label: 'M&A угода',      score: 80, emoji: '💼' },
+  '1.02': { label: 'M&A завершення', score: 70, emoji: '💼' },
+  '1.03': { label: 'Банкрутство',    score: 90, emoji: '💥' },
+  '2.02': { label: 'Результати',     score: 50, emoji: '📊' },
+  '2.04': { label: 'Дефолт',         score: 85, emoji: '🔴' },
+  '5.01': { label: 'Зміна власника', score: 75, emoji: '🎯' },
+  '5.02': { label: 'Зміна CEO/CFO',  score: 70, emoji: '👤' },
+  '7.01': { label: 'Прес-реліз',     score: 30, emoji: '📢' },
+  '8.01': { label: 'Інше',           score: 20, emoji: '📄' },
+};
+
 const SEC_FORMS = {
   'S-1':   { label: 'IPO',        emoji: '🚀', score: 80 },
   'S-1/A': { label: 'IPO амend',  emoji: '🚀', score: 40 },
@@ -1644,7 +1656,8 @@ const SEC_FORMS = {
 
 async function fetchSecFilings(forms) {
   const now = Date.now();
-  if (now - secCache.fetchedAt < 300000 && secCache.items.length) return secCache.items;
+  const cacheKey = forms || 'default';
+  if (now - secCache.fetchedAt < 300000 && secCache.items.length && secCache.key === cacheKey) return secCache.items;
 
   const today = new Date().toISOString().slice(0, 10);
   const yesterday = new Date(now - 86400000).toISOString().slice(0, 10);
@@ -1655,7 +1668,7 @@ async function fetchSecFilings(forms) {
       encodeURIComponent(formList) +
       '&dateRange=custom&startdt=' + yesterday +
       '&enddt=' + today +
-      '&_source=file_date,display_names,period_ending,file_num,root_forms,biz_states&from=0&size=50';
+      '&_source=file_date,display_names,period_ending,file_num,root_forms,biz_states,items&from=0&size=100';
 
     https.get({
       hostname: 'efts.sec.gov',
@@ -1681,7 +1694,21 @@ async function fetchSecFilings(forms) {
             if (seen.has(key)) continue;
             seen.add(key);
 
-            const meta = SEC_FORMS[form] || { label: form, emoji: '📄', score: 20 };
+            let meta = SEC_FORMS[form] || { label: form, emoji: '📄', score: 20 };
+            let itemTypes = s.items || [];
+
+            // Для 8-K — беремо найважливіший item
+            if (form === '8-K' && itemTypes.length) {
+              const best = itemTypes
+                .map(it => EIGHT_K_ITEMS[it] || { label: it, score: 0, emoji: '📄' })
+                .sort((a, b) => b.score - a.score)[0];
+              if (best.score > meta.score || best.score > 20) {
+                meta = { ...meta, label: best.label, emoji: best.emoji, score: Math.max(meta.score, best.score) };
+              }
+              // Фільтруємо нудні 8-K (тільки 8.01, 7.01, 9.01)
+              const maxScore = Math.max(...itemTypes.map(it => (EIGHT_K_ITEMS[it]||{score:0}).score));
+              if (maxScore < 40) continue; // пропускаємо нецікаві
+            }
 
             items.push({
               company: company.slice(0, 60),
@@ -1693,13 +1720,14 @@ async function fetchSecFilings(forms) {
               state: s.biz_states?.[0] || '',
               date: s.file_date,
               url: 'https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=' +
-                   (s.file_num?.[0] || '') + '&type=' + encodeURIComponent(form)
+                   (s.file_num?.[0] || '') + '&type=' + encodeURIComponent(form),
+              itemTypes
             });
           }
 
           // Сортуємо за score (важливість форми)
           items.sort((a, b) => b.score - a.score);
-          secCache = { items, fetchedAt: now };
+          secCache = { items, fetchedAt: now, key: cacheKey };
           console.log('SEC updated:', items.length, 'filings, forms:', [...new Set(items.map(i => i.form))].join(','));
           resolve(items);
         } catch(e) {
