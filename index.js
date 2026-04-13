@@ -1115,6 +1115,8 @@ const server = http.createServer((req, res) => {
   if (req.url.startsWith('/sec')) {
     const params = new URLSearchParams(req.url.split('?')[1]||'');
     const forms = params.get('forms') || 'S-1,S-1/A,8-K,SC 13D,425,DEFM14A';
+    // Скидаємо кеш якщо запит з браузера (force refresh)
+    if (params.get('refresh') === '1') secCache.fetchedAt = 0;
     fetchSecFilings(forms).then(items => {
       res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
       res.end(JSON.stringify({ items, fetchedAt: secCache.fetchedAt, count: items.length }));
@@ -1705,9 +1707,9 @@ async function fetchSecFilings(forms) {
               if (best.score > meta.score || best.score > 20) {
                 meta = { ...meta, label: best.label, emoji: best.emoji, score: Math.max(meta.score, best.score) };
               }
-              // Фільтруємо нудні 8-K (тільки 8.01, 7.01, 9.01)
-              const maxScore = Math.max(...itemTypes.map(it => (EIGHT_K_ITEMS[it]||{score:0}).score));
-              if (maxScore < 40) continue; // пропускаємо нецікаві
+              // Фільтруємо нудні 8-K
+              const maxScore = itemTypes.length ? Math.max(...itemTypes.map(it => (EIGHT_K_ITEMS[it]||{score:0}).score)) : 0;
+              if (maxScore < 40) { seen.delete(key); continue; }
             }
 
             items.push({
