@@ -228,6 +228,66 @@ function fetchGdeltSignal(title, lang, wiki, edits, editors) {
   });
 }
 
+
+// ── COMMENT SIGNAL DETECTION ──
+function parseComment(comment) {
+  if (!comment) return { signal: 0, keywords: [], sentiment: 0 };
+  const c = comment.toLowerCase();
+  const keywords = [];
+  let signal = 0;
+  let sentiment = 0;
+
+  // Смерть / трагедія
+  if (/\bdied\b|\bdeath\b|\bkilled\b|\bmurdered\b|\bdeceased\b/.test(c)) {
+    keywords.push('DEATH'); signal += 30; sentiment = -1;
+  }
+  // Катастрофа
+  if (/\bcrash\b|\bdisaster\b|\bexplosion\b|\battack\b|\bterror\b/.test(c)) {
+    keywords.push('DISASTER'); signal += 25; sentiment = -1;
+  }
+  // Арешт / скандал
+  if (/\barrested\b|\bcharged\b|\bconvicted\b|\bscandal\b|\bindicted\b/.test(c)) {
+    keywords.push('SCANDAL'); signal += 22; sentiment = -1;
+  }
+  // Перемога / призначення
+  if (/\belected\b|\bwon\b|\bappointed\b|\bnamed\b|\bchosen\b/.test(c)) {
+    keywords.push('APPOINTED'); signal += 20; sentiment = 1;
+  }
+  // Банкрутство / колапс
+  if (/\bbankrupt\b|\bcollapsed\b|\bfiled\b|\bliquidat\b/.test(c)) {
+    keywords.push('BANKRUPT'); signal += 22; sentiment = -1;
+  }
+  // Edit war сигнали
+  if (/\breverted\b|\bundone\b|\bvandaliz\b/.test(c)) {
+    keywords.push('REVERT'); signal -= 5; sentiment = 0;
+  }
+  // Захист статті
+  if (/\bprotected\b|\bsemi-protected\b/.test(c)) {
+    keywords.push('PROTECTED'); signal += 10;
+  }
+  // Нова секція (некролог, біографія)
+  if (/\/\* ?(death|personal life|early life|legacy|aftermath) ?\*\//.test(c)) {
+    keywords.push('SECTION:'+c.match(/\/\* ?([^*]+) ?\*\//)?.[1]?.trim().toUpperCase());
+    signal += 15;
+  }
+
+  return { signal, keywords, sentiment };
+}
+
+// ── ARTICLE AGE ──
+const articleFirstSeen = {}; // title → timestamp першого SSE
+
+function getArticleAgeBonus(title, isNewArticle) {
+  const now = Date.now();
+  if (isNewArticle) { articleFirstSeen[title] = now; return 40; }
+  if (!articleFirstSeen[title]) { articleFirstSeen[title] = now; return 0; }
+  const ageMin = (now - articleFirstSeen[title]) / 60000;
+  // Стаття з'явилась в нашому вікні моніторингу дуже нещодавно
+  if (ageMin < 60)  return 20;
+  if (ageMin < 360) return 10;
+  return 0;
+}
+
 // ── SUPABASE ──
 const SUPABASE_URL = process.env.SUPABASE_URL || '';
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY || '';
@@ -466,7 +526,7 @@ function looksLikeBot(user, isBot) {
   return false;
 }
 
-async function checkAnomaly(title, wiki, user, isBot) {
+async function checkAnomaly(title, wiki, user, isBot, meta={}) {
   const lang = wiki.replace('wiki', '') || 'en';
   const key = wiki + ':' + title;
   const now = Date.now();
@@ -525,14 +585,19 @@ async function checkAnomaly(title, wiki, user, isBot) {
         const e = uniq300;
         const editorScore = e<=2?e*2.5:e<=4?5+(e-2)*8:e<=9?21+(e-4)*20:121+(e-10)*40;
         const actScore = editorScore + hits300 * 0.8;
-        // span — час активності в хвилинах (з anomWindow)
         const spanMin = (now - (w.firstSeen || now)) / 60000;
         const susScore = Math.min(spanMin / 10, 15);
-        // resonanceBonus — якщо є в trending
         const resonanceBonus = trendPct && uniq300 >= 2 ? 25 : 0;
-        // burst бонус — 5+ редакторів за перші 10 хв
         const burstBonus = e >= 5 && spanMin <= 10 ? 30 : 0;
-        const score = typeScore + langScore + trendScore + pvScore + actScore + susScore + resonanceBonus + burstBonus;
+        // НОВІ метрики
+        const commentParsed = parseComment(meta.comment||w.lastComment||'');
+        const commentBonus = Math.max(0, commentParsed.signal);
+        const deltaBonus = meta.deltaBytes > 5000 ? 20 : meta.deltaBytes < -2000 ? 15 : 0;
+        const ageBonus = getArticleAgeBonus(title, meta.isNewArticle||false);
+        const score = typeScore + langScore + trendScore + pvScore + actScore + susScore + resonanceBonus + burstBonus + commentBonus + deltaBonus + ageBonus;
+        // Зберігаємо для наступних правок
+        if (!w.lastComment && meta.comment) w.lastComment = meta.comment;
+        if (commentParsed.keywords.length) w.commentKeywords = commentParsed.keywords;
 
         supabaseInsert('anomalies', {
           title, wiki, lang,
@@ -544,7 +609,11 @@ async function checkAnomaly(title, wiki, user, isBot) {
           url: wikiUrl,
           score: Math.round(score),
           is_trending: trendPct !== null,
-          trend_pct: trendPct
+          trend_pct: trendPct,
+          comment_keywords: commentParsed.keywords.join(',') || null,
+          delta_bytes: meta.deltaBytes || 0,
+          is_new_article: meta.isNewArticle || false,
+          sentiment: commentParsed.sentiment
         }, 'title,wiki');
 
         // PAI розраховується вручну через Spider → /api/pai
@@ -1164,12 +1233,18 @@ function connectGlobalUpstream() {
             if ((data.type === 'edit' || data.type === 'new') &&
                 ALL_WIKIS.has(data.wiki) &&
                 data.title && !data.title.includes(':')) {
-              checkAnomaly(data.title, data.wiki, data.user, data.bot);
+              const deltaBytes = (data.length?.new||0) - (data.length?.old||0);
+              const comment = data.comment || data.parsedcomment || '';
+              const isNewArticle = data.type === 'new' || (data.revision?.old === 0);
+              const meta = { deltaBytes, comment, isNewArticle };
+              checkAnomaly(data.title, data.wiki, data.user, data.bot, meta);
               const msg = 'data: ' + JSON.stringify({
                 title: data.title, wiki: data.wiki,
                 user: data.user, bot: data.bot,
                 type: data.type, timestamp: data.timestamp,
-                tier: getTier(data.wiki)
+                tier: getTier(data.wiki),
+                deltaBytes, comment: comment.slice(0,100),
+                isNewArticle
               }) + '\n\n';
               // Broadcast to all connected clients
               sseClients.forEach(client => {
