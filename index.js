@@ -546,6 +546,9 @@ async function checkAnomaly(title, wiki, user, isBot) {
           is_trending: trendPct !== null,
           trend_pct: trendPct
         }, 'title,wiki');
+
+        // PAI розраховується вручну через Spider → /api/pai
+
       }).catch(() => {
         supabaseInsert('anomalies', {
           title, wiki, lang, type: 'mul',
@@ -1481,6 +1484,89 @@ function findCrossSignals() {
 // ════════════════════════════════════════
 
 const VERCEL_PV = 'https://resonance-dashboard-7a1u.vercel.app/api/pageviews';
+
+// ════════════════════════════════════════
+// PAI — Піміно Amplification Index
+// Оцінює потенціал поширення події через Claude
+// ════════════════════════════════════════
+
+const paiCache = {}; // title → {pai, details, ts}
+
+async function calcPAI(title, articleType, langCount, editors) {
+  const cacheKey = title;
+  const now = Date.now();
+
+  // Кешуємо на 24 год
+  if (paiCache[cacheKey] && now - paiCache[cacheKey].ts < 86400000) {
+    return paiCache[cacheKey];
+  }
+
+  // Тільки для важливих подій щоб не витрачати API
+  const importantTypes = ['СМЕРТЬ','ПОЛІТИК','ГЕОПОЛІТИКА','ВІЙСЬКОВІ','БІЗНЕС'];
+  if (!importantTypes.includes(articleType) && langCount < 20) return null;
+
+  const prompt = `Analyze this Wikipedia event for viral/resonance potential.
+Event: "${title}"
+Type: ${articleType || 'unknown'}
+Language versions: ${langCount}
+Simultaneous editors: ${editors}
+
+Rate these 4 factors from 0.0 to 1.0:
+1. identification: Can people identify with the victim/subject? (0=no, 1=universal)
+2. concrete_villain: Is there a specific named perpetrator/cause? (0=anonymous system, 1=named person)
+3. amplifier: Is there an existing movement/media ready to amplify? (0=none, 1=large ready audience)
+4. evidence: Is there visual/video evidence or clear documentation? (0=none, 1=viral video)
+
+Also provide:
+- amplification_type: "person" | "movement" | "symbol" | "system" | "none"
+- resonance_prediction: "viral" | "regional" | "local" | "none"
+- brief_reason: one sentence why
+
+Respond ONLY with valid JSON, no markdown:
+{"identification":0.0,"concrete_villain":0.0,"amplifier":0.0,"evidence":0.0,"amplification_type":"none","resonance_prediction":"none","brief_reason":"..."}`;
+
+  return new Promise((resolve) => {
+    const body = JSON.stringify({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 300,
+      messages: [{ role: 'user', content: prompt }]
+    });
+
+    const req = https.request({
+      hostname: 'api.anthropic.com',
+      path: '/v1/messages',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+        'anthropic-version': '2023-06-01',
+        'x-api-key': process.env.ANTHROPIC_API_KEY || ''
+      }
+    }, (res) => {
+      let data = '';
+      res.on('data', c => data += c);
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(data);
+          const text = (json.content || []).filter(b => b.type === 'text').map(b => b.text).join('').trim();
+          const details = JSON.parse(text);
+          const pai = details.identification * details.concrete_villain * details.amplifier * details.evidence;
+          const result = { pai: Math.round(pai * 100) / 100, details, ts: Date.now() };
+          paiCache[cacheKey] = result;
+          console.log('PAI:', title, '→', result.pai, details.resonance_prediction);
+          resolve(result);
+        } catch(e) {
+          console.log('PAI parse error:', e.message);
+          resolve(null);
+        }
+      });
+    });
+    req.on('error', () => resolve(null));
+    req.setTimeout(15000, () => { req.destroy(); resolve(null); });
+    req.write(body);
+    req.end();
+  });
+}
 
 async function pollPageviews() {
   if (!trendingCache.items.length) return;
