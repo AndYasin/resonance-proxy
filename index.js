@@ -538,6 +538,10 @@ async function checkAnomaly(title, wiki, user, isBot, meta={}) {
   w.lastSeen = now;
   const isMinor = meta?.isMinor || false;
   w.ts60.push(now); w.ts300.push(now);
+  // Збираємо коментарі і delta bytes
+  if (typeof comment === 'string' && comment) w.comments.push(comment.toLowerCase().slice(0,100));
+  if (typeof deltaBytes === 'number') w.deltaBytes += deltaBytes;
+  if (w.comments.length > 50) w.comments = w.comments.slice(-50);
   if (isMinor) w.minorCount = (w.minorCount||0)+1;
   else w.nonMinorCount = (w.nonMinorCount||0)+1;
   // Не рахуємо ботів і тимчасові акаунти як унікальних редакторів
@@ -1540,6 +1544,66 @@ async function checkPredictionSignals(title, wiki, editors, score) {
 // Оновлюємо prediction cache кожні 10 хв
 fetchAllPredictions();
 setInterval(fetchAllPredictions, 600000);
+
+
+// ════════════════════════════════════════
+// KEYWORD DETECTION + NEW SCORING
+// ════════════════════════════════════════
+
+const KEYWORD_GROUPS = {
+  CRISIS:      { words: ['bankruptcy','chapter 11','bankrupt','insolvent','collapsed','fraud','arrested','indicted','charged','convicted','coup','overthrow','martial law','state of emergency','shooting','explosion','disaster','crash','killed'], score: 60 },
+  MILESTONE:   { words: ['trillion','billion dollar','record high','all-time high','most valuable','milestone','historic','unprecedented','largest ever','first ever','ipo','went public','listed on nasdaq','listed on nyse'], score: 50 },
+  CORPORATE:   { words: ['acquisition','acquired','merger','takeover','spinoff','spin-off','joint venture','stake','buyout','privatization','delisted','stepped down','resigned','appointed','fired','ousted','ceo change'], score: 40 },
+  GEOPOLITICAL:{ words: ['invaded','invasion','sanctions','ceasefire','annexed','annexation','declared war','military operation','airstrike','coup','referendum','independence'], score: 35 },
+  CRYPTO:      { words: ['exploit','hack','rug pull','token launch','listing','delisted','sec charges','ponzi','exit scam','flash loan'], score: 25 },
+  REWRITE:     { words: ['rewrite','major revision','complete overhaul','restructure','rewrote'], score: 30 },
+  CURRENT:     { words: ['{{current}}','currentevent','this article documents','breaking'], score: 45 },
+  PROTECTION:  { words: ['protected','semi-protected','full protection','edit war','editwar'], score: 20 },
+};
+
+function detectKeywords(comments) {
+  const text = comments.join(' ').toLowerCase();
+  const found = [];
+  let bonusScore = 0;
+  
+  for (const [group, cfg] of Object.entries(KEYWORD_GROUPS)) {
+    if (cfg.words.some(w => text.includes(w))) {
+      found.push(group);
+      bonusScore += cfg.score;
+    }
+  }
+  return { keywords: found, bonusScore };
+}
+
+function calcNewScore({ editors, langCount, trendPct, deltaBytes, keywords, bonusScore, isNew, pvRatio, predictionMatch }) {
+  // ШАР 1: якість сигналу (редактори)
+  const editorMult = editors >= 10 ? 3.0 : editors >= 5 ? 2.0 : editors >= 3 ? 1.5 : editors >= 2 ? 1.0 : 0.5;
+  
+  // ШАР 2: зміст коментарів
+  const contentScore = bonusScore || 0;
+  
+  // ШАР 3: контекст (мови)
+  const langMult = langCount >= 50 ? 2.5 : langCount >= 20 ? 1.8 : langCount >= 10 ? 1.3 : langCount >= 5 ? 1.2 : langCount >= 2 ? 0.8 : 0.4;
+  
+  // Базовий score
+  let score = (editors * 3 + contentScore) * editorMult * langMult;
+  
+  // Підсилювачі
+  if (trendPct >= 100) score *= 1.5;
+  else if (trendPct >= 50) score *= 1.3;
+  
+  if (pvRatio >= 5) score *= 1.3;
+  else if (pvRatio >= 2) score *= 1.1;
+  
+  if (predictionMatch) score *= 1.3;
+  
+  if (deltaBytes > 5000) score *= 1.2;
+  else if (deltaBytes < -2000) score *= 0.8;
+  
+  if (isNew) score *= 1.8;
+  
+  return Math.round(score);
+}
 
 connectGlobalUpstream();
 
