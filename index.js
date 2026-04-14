@@ -1746,13 +1746,23 @@ async function fetchSecFilings(forms) {
 // Cross-signal: SEC filing + Wikipedia burst
 async function checkSecWikiSignal(secItem) {
   if (!secItem.company) return;
-  const words = secItem.company.toLowerCase().split(/\s+/).filter(w => w.length > 3 && !['inc','corp','ltd','llc','the','and'].includes(w));
+  // Беремо тільки значимі слова - мінімум 5 символів, не стоп-слова
+  const stopWords = new Set(['inc','corp','ltd','llc','the','and','for','with','from','that','this','have','will','been','were','they','their','your','what','when','where','which','who','how','its','our','more','also','than','into','over','after','some','such','only','each','most','then','other','these','those','would','could','should','about','there','between','through','because','within','without','during','before','after','since','while','group','holdings','company','partners','capital','management','services','solutions','systems','technologies','therapeutics','biosciences','health']);
   
-  // Шукаємо в anomWindow чи є Wikipedia активність по цій компанії
+  const words = secItem.company.toLowerCase()
+    .replace(/[.,()]/g, ' ')
+    .split(/\s+/)
+    .filter(w => w.length >= 5 && !stopWords.has(w));
+  
+  if (words.length === 0) return; // нема значимих слів
+  
+  // Шукаємо в anomWindow
   for (const [key, w] of Object.entries(anomWindow)) {
     const wikiTitle = key.split(':').slice(1).join(':').toLowerCase();
-    const match = words.some(word => wikiTitle.includes(word));
-    if (!match) continue;
+    // Мінімум 1 значиме слово має точно матчитись (не підрядок)
+    const wikiWords = wikiTitle.split(/\s+/);
+    const matchCount = words.filter(word => wikiWords.includes(word)).length;
+    if (matchCount === 0) continue; // тільки точний збіг слів
     if (w.ts300.length < 2) continue;
 
     console.log('SEC+WIKI signal:', secItem.company, '->', wikiTitle, '| form:', secItem.form);
