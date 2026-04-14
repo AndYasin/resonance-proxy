@@ -908,6 +908,102 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+
+  // ── /wikidata — Wikidata граф пов'язаних entities ──
+  if (req.url.startsWith('/wikidata?')) {
+    const q = new URLSearchParams(req.url.split('?')[1]||'').get('title') || '';
+    if (!q) { res.writeHead(400, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'}); res.end('{}'); return; }
+
+    const cached = getCached('wikidata:'+q);
+    if (cached) {
+      res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+      res.end(cached);
+      return;
+    }
+
+    // Крок 1: знайти Wikidata QID для title
+    const searchUrl = 'https://www.wikidata.org/w/api.php?action=wbsearchentities&search='
+      + encodeURIComponent(q) + '&language=en&limit=1&format=json';
+
+    https.get(searchUrl, { headers: { 'User-Agent': 'ResonanceBot/1.0' } }, (r) => {
+      let raw = ''; r.on('data', d => raw += d);
+      r.on('end', async () => {
+        try {
+          const data = JSON.parse(raw);
+          const entity = data.search?.[0];
+          if (!entity?.id) {
+            const empty = JSON.stringify({ title: q, qid: null, nodes: [] });
+            res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+            res.end(empty);
+            return;
+          }
+          const qid = entity.id;
+
+          // Крок 2: SPARQL — тягнемо пов'язані entities
+          const sparql = `SELECT ?rel ?relLabel ?related ?relatedLabel WHERE {
+  VALUES ?item { wd:${qid} }
+  VALUES ?rel {
+    wdt:P131 wdt:P17 wdt:P571 wdt:P159 wdt:P749
+    wdt:P169 wdt:P127 wdt:P355 wdt:P452 wdt:P1056
+    wdt:P137 wdt:P199 wdt:P740 wdt:P1366 wdt:P1365
+  }
+  ?item ?rel ?related .
+  ?related rdfs:label ?relatedLabel FILTER(LANG(?relatedLabel)='en') .
+  ?relProp wikibase:directClaim ?rel ; rdfs:label ?relLabel FILTER(LANG(?relLabel)='en') .
+} LIMIT 30`;
+
+          const sparqlUrl = 'https://query.wikidata.org/sparql?query=' + encodeURIComponent(sparql) + '&format=json';
+
+          https.get(sparqlUrl, {
+            headers: { 'User-Agent': 'ResonanceBot/1.0', 'Accept': 'application/json' }
+          }, (r2) => {
+            let raw2 = ''; r2.on('data', d => raw2 += d);
+            r2.on('end', () => {
+              try {
+                const sparqlData = JSON.parse(raw2);
+                const bindings = sparqlData.results?.bindings || [];
+                const nodes = bindings.map(b => ({
+                  relation: b.relLabel?.value || '',
+                  title: b.relatedLabel?.value || '',
+                  qid: b.related?.value?.split('/').pop() || ''
+                })).filter(n => n.title && n.title !== q);
+
+                // Дедуп
+                const seen = new Set();
+                const unique = nodes.filter(n => {
+                  if (seen.has(n.title)) return false;
+                  seen.add(n.title);
+                  return true;
+                });
+
+                console.log('Wikidata graph:', q, '| QID:', qid, '| nodes:', unique.length);
+                const result = JSON.stringify({ title: q, qid, nodes: unique, fetchedAt: Date.now() });
+                setCache('wikidata:'+q, result);
+                res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+                res.end(result);
+              } catch(e) {
+                console.log('Wikidata SPARQL error:', e.message);
+                res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+                res.end(JSON.stringify({ title: q, qid, nodes: [], error: e.message }));
+              }
+            });
+          }).on('error', e => {
+            res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+            res.end(JSON.stringify({ title: q, qid, nodes: [], error: e.message }));
+          });
+
+        } catch(e) {
+          res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+          res.end(JSON.stringify({ title: q, qid: null, nodes: [], error: e.message }));
+        }
+      });
+    }).on('error', e => {
+      res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+      res.end(JSON.stringify({ title: q, qid: null, nodes: [] }));
+    });
+    return;
+  }
+
   // /ping endpoint — keepalive
   if (req.url === '/ping') {
     res.writeHead(200, { 'Content-Type': 'text/plain', 'Access-Control-Allow-Origin': '*' });
@@ -1158,6 +1254,84 @@ setInterval(() => {
     if (!editorLog[e].length) delete editorLog[e];
   });
 }, 21600000);
+
+
+// ── WIKIDATA GRAPH CHECK — перевірка кіл хвилі ──
+async function checkWikidataGraph(title, wiki, score) {
+  if (score < 40) return; // тільки для значимих аномалій
+
+  try {
+    // Тягнемо граф через власний endpoint
+    const searchUrl = 'https://www.wikidata.org/w/api.php?action=wbsearchentities&search='
+      + encodeURIComponent(title) + '&language=en&limit=1&format=json';
+
+    const qidData = await new Promise((resolve) => {
+      https.get(searchUrl, { headers: { 'User-Agent': 'ResonanceBot/1.0' } }, (r) => {
+        let raw = ''; r.on('data', d => raw += d);
+        r.on('end', () => { try { resolve(JSON.parse(raw)); } catch(e) { resolve({}); } });
+      }).on('error', () => resolve({}));
+    });
+
+    const qid = qidData.search?.[0]?.id;
+    if (!qid) return;
+
+    // Спрощений SPARQL — тільки найближчі зв'язки
+    const sparql = `SELECT ?relatedLabel WHERE {
+  VALUES ?item { wd:${qid} }
+  VALUES ?rel { wdt:P749 wdt:P355 wdt:P452 wdt:P137 wdt:P1366 wdt:P1365 wdt:P169 }
+  ?item ?rel ?related .
+  ?related rdfs:label ?relatedLabel FILTER(LANG(?relatedLabel)='en') .
+} LIMIT 15`;
+
+    const sparqlUrl = 'https://query.wikidata.org/sparql?query=' + encodeURIComponent(sparql) + '&format=json';
+
+    const sparqlData = await new Promise((resolve) => {
+      https.get(sparqlUrl, {
+        headers: { 'User-Agent': 'ResonanceBot/1.0', 'Accept': 'application/json' }
+      }, (r) => {
+        let raw = ''; r.on('data', d => raw += d);
+        r.on('end', () => { try { resolve(JSON.parse(raw)); } catch(e) { resolve({}); } });
+      }).on('error', () => resolve({}));
+    });
+
+    const nodes = (sparqlData.results?.bindings || [])
+      .map(b => b.relatedLabel?.value)
+      .filter(Boolean);
+
+    if (!nodes.length) return;
+
+    // Перевіряємо чи є ці вузли в аномWindow (активні прямо зараз)
+    const activeNodes = nodes.filter(nodeTitle => {
+      return Object.keys(anomWindow).some(k => {
+        const t = k.split(':').slice(1).join(':').toLowerCase();
+        return t === nodeTitle.toLowerCase() && anomWindow[k].ts300.length >= 2;
+      });
+    });
+
+    if (activeNodes.length > 0) {
+      console.log('GRAPH SIGNAL:', title, '| active nodes:', activeNodes.join(', '));
+      supabaseInsert('cross_signals', {
+        type: 'WIKI+GRAPH',
+        title: title,
+        detail: 'активні вузли: ' + activeNodes.join(', ') + ' · QID: ' + qid,
+        wiki_title: title,
+        crypto_symbol: null,
+        score: score + activeNodes.length * 20
+      }, 'title,type');
+
+      if (TELEGRAM_TOKEN && activeNodes.length >= 2) {
+        sendTelegram(
+          '🕸 <b>Graph Signal: ' + title + '</b>\n\n' +
+          'Wikidata граф активний:\n' +
+          activeNodes.map(n => '• ' + n).join('\n') + '\n\n' +
+          '📊 ' + activeNodes.length + ' повязаних статей редагуються одночасно'
+        );
+      }
+    }
+  } catch(e) {
+    console.log('Graph check error:', e.message);
+  }
+}
 
 connectGlobalUpstream();
 
