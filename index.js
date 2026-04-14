@@ -1803,6 +1803,121 @@ async function pollSec() {
 pollSec();
 setInterval(pollSec, 900000); // кожні 15 хв
 
+
+// ════════════════════════════════════════
+// GROQ LLM — семантична класифікація
+// Wikipedia коментарів
+// ════════════════════════════════════════
+
+const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
+const GROQ_MODEL = 'llama-3.3-70b-versatile';
+
+// Кеш щоб не класифікувати однакові коментарі двічі
+const groqCache = new Map();
+
+async function classifyWithGroq(comments, title, wiki) {
+  if (!GROQ_API_KEY) return null;
+  if (!comments?.length) return null;
+
+  // Беремо тільки унікальні непорожні коментарі
+  const unique = [...new Set(comments.filter(c => c && c.length > 5))].slice(0, 5);
+  if (!unique.length) return null;
+
+  const cacheKey = unique.join('|');
+  if (groqCache.has(cacheKey)) return groqCache.get(cacheKey);
+
+  const prompt = `You are a financial signal detector analyzing Wikipedia edit comments.
+
+Article: "${title}" (${wiki})
+Recent edit comments:
+${unique.map((c, i) => `${i+1}. "${c}"`).join('\n')}
+
+Respond ONLY with valid JSON, no markdown, no explanation:
+{
+  "event_type": "IPO|CRISIS|MILESTONE|DEATH|CORPORATE|GEOPOLITICAL|CRYPTO|NOISE",
+  "signal_strength": 0.0,
+  "affected_assets": [],
+  "direction": "LONG|SHORT|STRADDLE|WATCH|NONE",
+  "pimino_score": 0.0,
+  "keywords": [],
+  "reasoning": "one sentence max"
+}
+
+Rules:
+- signal_strength: 0.0-1.0 (how financially significant)
+- pimino_score: 0.0-1.0 (viral amplification potential)
+- affected_assets: stock tickers, sectors, or currencies
+- direction: market direction implied by the event
+- NOISE if edits are routine/maintenance`;
+
+  return new Promise((resolve) => {
+    const body = JSON.stringify({
+      model: GROQ_MODEL,
+      max_tokens: 250,
+      temperature: 0.1,
+      messages: [{ role: 'user', content: prompt }]
+    });
+
+    const req = https.request({
+      hostname: 'api.groq.com',
+      path: '/openai/v1/chat/completions',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + GROQ_API_KEY,
+        'Content-Length': Buffer.byteLength(body)
+      }
+    }, (res) => {
+      let data = '';
+      res.on('data', c => data += c);
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(data);
+          if (json.error) {
+            console.log('Groq API error:', json.error.message?.slice(0,80));
+            resolve(null); return;
+          }
+          const text = json.choices?.[0]?.message?.content || '{}';
+          const clean = text.replace(/```json|```/g, '').trim();
+          const result = JSON.parse(clean);
+
+          // Кешуємо на 30 хвилин
+          groqCache.set(cacheKey, result);
+          setTimeout(() => groqCache.delete(cacheKey), 1800000);
+
+          console.log('Groq classified:', title,
+            '| type:', result.event_type,
+            '| strength:', result.signal_strength,
+            '| pimino:', result.pimino_score,
+            '| assets:', result.affected_assets?.join(',') || 'none'
+          );
+          resolve(result);
+        } catch(e) {
+          console.log('Groq parse error:', e.message, data.slice(0,100));
+          resolve(null);
+        }
+      });
+    });
+    req.on('error', e => { console.log('Groq req error:', e.message); resolve(null); });
+    req.setTimeout(8000, () => { req.destroy(); resolve(null); });
+    req.write(body);
+    req.end();
+  });
+}
+
+// Groq usage stats
+let groqStats = { calls: 0, hits: 0, errors: 0, resetAt: Date.now() };
+setInterval(() => {
+  if (groqStats.calls > 0) {
+    console.log('Groq stats (last hour):',
+      'calls:', groqStats.calls,
+      '| cache hits:', groqStats.hits,
+      '| errors:', groqStats.errors
+    );
+  }
+  groqStats = { calls: 0, hits: 0, errors: 0, resetAt: Date.now() };
+}, 3600000);
+
 connectGlobalUpstream();
 
 server.listen(process.env.PORT || 3000, '0.0.0.0', () => {
@@ -1811,7 +1926,7 @@ server.listen(process.env.PORT || 3000, '0.0.0.0', () => {
   console.log('TG thresholds — Tier1: 4+ editors | Tier2: 5+ editors | Tier3: 6+ editors');
   if (TELEGRAM_TOKEN) {
     sendTelegram(
-      '🟢 <b>Resonance v5 запущено</b>\n\n' +
+      '🟢 <b>Resonance v6 запущено</b>\n\n' +
       '📡 Wikipedia + GitHub + Binance\n' +
       '📡 Мов: ' + ALL_WIKIS.size + ' (en/de/fr/es/ru/ja/zh + ar/fa/ta/hi + 19 інших)\n\n' +
       '⚙️ Пороги Telegram:\n' +
