@@ -1270,7 +1270,7 @@ function logEditor(editor, title, wiki, lang, comment) {
       if (otherKey && anomWindow[thisKey] && anomWindow[otherKey]) {
         const otherEditors = anomWindow[otherKey].users300?.size || 0;
         const thisEditors = anomWindow[thisKey].users300?.size || 0;
-        if (otherEditors >= 1 && thisEditors >= 1) {
+        if (otherEditors >= 2 && thisEditors >= 2) {
           console.log('EDITOR OVERLAP:', editor, '|', title, '<->', otherTitle);
           supabaseInsert('cross_signals', {
             type: 'EDITOR+OVERLAP',
