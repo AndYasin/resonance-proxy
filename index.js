@@ -1478,7 +1478,11 @@ For each included signal:
 Respond ONLY with valid JSON array. If no signals meet criteria, return []:
 [{"rank":1,"title":"...","pattern":"...","urgency":"...","signals":[],"reasoning":"...","assets":[],"convergence":3}]
 
-Maximum 7 items. Quality over quantity.`;
+Maximum 7 items. Quality over quantity.
+Additional rules:
+- DEATH of any person with 20+ language Wikipedia versions = always include (urgency URGENT)
+- If today has no strong financial signals, include top 3 most significant events anyway with LOW urgency
+- Never return empty array — always include at least 1-3 items`;
 
     // 4. Відправляємо в Groq
     const result = await new Promise((resolve) => {
