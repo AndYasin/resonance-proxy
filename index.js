@@ -459,7 +459,7 @@ async function checkAnomaly(title, wiki, user, isBot, comment) {
   // Збираємо коментарі
   if (comment) { w.comments.push(comment.toLowerCase().slice(0,100)); if (w.comments.length > 30) w.comments = w.comments.slice(-30); }
   // Не рахуємо ботів і тимчасові акаунти як унікальних редакторів
-  if (user && !looksLikeBot(user, isBot)) { w.users60.add(user); w.users300.add(user); }
+  if (user && !looksLikeBot(user, isBot)) { w.users60.add(user); w.users300.add(user); logEditor(user, title, wiki, lang, comment); }
   w.ts60  = w.ts60.filter(t => now - t < 60000);
   w.ts300 = w.ts300.filter(t => now - t < 300000);
   if (w.ts60.length === 0) w.users60 = new Set();
@@ -1098,6 +1098,67 @@ function connectGlobalUpstream() {
 }
 
 // Start global Wikipedia upstream immediately on launch
+
+// ── EDITOR ACTIVITY LOG + OVERLAP DETECTION ──
+const editorLog = {}; // editor -> [{title, wiki, ts}] — in-memory за останні 24г
+
+function logEditor(editor, title, wiki, lang, comment) {
+  if (!editor || looksLikeBot(editor, false)) return;
+  const now = Date.now();
+
+  // In-memory лог
+  if (!editorLog[editor]) editorLog[editor] = [];
+  editorLog[editor].push({ title, wiki, ts: now });
+  // Чистимо старіші 24г
+  editorLog[editor] = editorLog[editor].filter(e => now - e.ts < 86400000);
+
+  // Пишемо в Supabase (тільки named users, не IP)
+  if (!/^d+.d+/.test(editor) && !editor.startsWith('~')) {
+    supabaseInsert('editor_activity', {
+      editor: editor.slice(0, 100),
+      title: title.slice(0, 200),
+      wiki,
+      lang,
+      comment: (comment||'').slice(0, 100)
+    });
+  }
+
+  // Перевіряємо overlap — чи редагував цей editor інші статті за останні 6г
+  const recent = editorLog[editor].filter(e => now - e.ts < 21600000 && e.title !== title);
+  if (recent.length >= 1) {
+    const otherTitles = [...new Set(recent.map(e => e.title))];
+    // Перетин сигнал — тільки якщо обидві статті мали аномалії
+    otherTitles.forEach(otherTitle => {
+      const otherKey = Object.keys(anomWindow).find(k => k.includes(':' + otherTitle));
+      const thisKey = wiki + ':' + title;
+      if (otherKey && anomWindow[thisKey] && anomWindow[otherKey]) {
+        const otherEditors = anomWindow[otherKey].users300?.size || 0;
+        const thisEditors = anomWindow[thisKey].users300?.size || 0;
+        if (otherEditors >= 1 && thisEditors >= 1) {
+          console.log('EDITOR OVERLAP:', editor, '|', title, '<->', otherTitle);
+          supabaseInsert('cross_signals', {
+            type: 'EDITOR+OVERLAP',
+            title: title + ' ↔ ' + otherTitle,
+            detail: 'editor: ' + editor + ' · редагував обидві статті за 6г',
+            wiki_title: title,
+            crypto_symbol: null,
+            score: 60
+          }, 'title,type');
+        }
+      }
+    });
+  }
+}
+
+// Чистимо editorLog кожні 6г
+setInterval(() => {
+  const now = Date.now();
+  Object.keys(editorLog).forEach(e => {
+    editorLog[e] = editorLog[e].filter(x => now - x.ts < 86400000);
+    if (!editorLog[e].length) delete editorLog[e];
+  });
+}, 21600000);
+
 connectGlobalUpstream();
 
 server.listen(process.env.PORT || 3000, '0.0.0.0', () => {
