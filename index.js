@@ -426,14 +426,6 @@ fetchTrending();
 setInterval(fetchTrending, 1800000);
 
 // ── ANOMALY CHECK ──
-// IPO keywords — поріг 1 редактор (підтверджено: CoreWeave T-1, Figma T-8, Circle T-9)
-const IPO_KEYWORDS = ['initial public offering','went public','listed on nasdaq','listed on nyse','ipo filing','direct listing','spac merger','going public','stock market debut','/* ipo */','/* funding */','/* initial public'];
-
-function hasIpoKeyword(comments) {
-  const text = (comments||[]).join(' ').toLowerCase();
-  return IPO_KEYWORDS.some(kw => text.includes(kw));
-}
-
 function looksLikeBot(user, isBot) {
   if (isBot) return true;
   if (!user) return false;
@@ -445,21 +437,19 @@ function looksLikeBot(user, isBot) {
   return false;
 }
 
-async function checkAnomaly(title, wiki, user, isBot, comment) {
+async function checkAnomaly(title, wiki, user, isBot) {
   const lang = wiki.replace('wiki', '') || 'en';
   const key = wiki + ':' + title;
   const now = Date.now();
 
   if (!anomWindow[key]) {
-    anomWindow[key] = { ts60:[], users60:new Set(), ts300:[], users300:new Set(), firedMulti:false, firedSingle:false, lastSeen:now, comments:[] };
+    anomWindow[key] = { ts60:[], users60:new Set(), ts300:[], users300:new Set(), firedMulti:false, firedSingle:false, lastSeen:now };
   }
   const w = anomWindow[key];
   w.lastSeen = now;
   w.ts60.push(now); w.ts300.push(now);
-  // Збираємо коментарі
-  if (comment) { w.comments.push(comment.toLowerCase().slice(0,100)); if (w.comments.length > 30) w.comments = w.comments.slice(-30); }
   // Не рахуємо ботів і тимчасові акаунти як унікальних редакторів
-  if (user && !looksLikeBot(user, isBot)) { w.users60.add(user); w.users300.add(user); logEditor(user, title, wiki, lang, comment); }
+  if (user && !looksLikeBot(user, isBot)) { w.users60.add(user); w.users300.add(user); }
   w.ts60  = w.ts60.filter(t => now - t < 60000);
   w.ts300 = w.ts300.filter(t => now - t < 300000);
   if (w.ts60.length === 0) w.users60 = new Set();
@@ -474,9 +464,8 @@ async function checkAnomaly(title, wiki, user, isBot, comment) {
   const spikeThreshold = getSpikeThreshold(wiki);
   const alertKey = key + ':' + Math.floor(now / 300000);
 
-  // ── Supabase: записуємо при 2+ редакторах АБО 1 редактор + IPO keyword ──
-  const ipoSignal = uniq300 >= 1 && hits300 >= 1 && hasIpoKeyword(w.comments);
-  if ((uniq300 >= 2 && hits300 >= 2 || ipoSignal) && !w.firedSupabase) {
+  // ── Supabase: записуємо при 2+ редакторах з повними даними ──
+  if (uniq300 >= 2 && hits300 >= 2 && !w.firedSupabase) {
     w.firedSupabase = true;
     const wikiUrl = 'https://' + lang + '.wikipedia.org/wiki/' + encodeURIComponent(title.replace(/ /g,'_'));
 
@@ -515,46 +504,6 @@ async function checkAnomaly(title, wiki, user, isBot, comment) {
         is_trending: trendPct !== null,
         trend_pct: trendPct
       });
-
-      // ── Groq класифікація ──
-      if (w.comments.length >= 2 && uniq300 >= 2) {
-        classifyWithGroq(w.comments, title, wiki).then(result => {
-          if (!result || result.event_type === 'NOISE') return;
-          if (result.signal_strength >= 0.6) {
-            supabaseInsert('cross_signals', {
-              type: 'WIKI+LLM',
-              title,
-              detail: result.event_type + ' · strength:' + result.signal_strength
-                + ' · pimino:' + result.pimino_score
-                + ' · assets:' + (result.affected_assets||[]).join(',')
-                + ' · ' + (result.direction||'')
-                + ' · ' + (result.reasoning||'').slice(0,100),
-              wiki_title: title,
-              crypto_symbol: null,
-              score: Math.round(result.signal_strength * 100)
-            });
-            // Telegram якщо дуже сильний сигнал
-            if (result.signal_strength >= 0.8 && TELEGRAM_TOKEN) {
-              const dirEmoji = result.direction==='LONG'?'📈':result.direction==='SHORT'?'📉':result.direction==='STRADDLE'?'↕️':'🤖';
-              sendTelegram(
-                dirEmoji + ' <b>LLM Signal: ' + title + '</b>\n\n' +
-                '🔮 ' + result.event_type + ' · strength: <b>' + result.signal_strength + '</b>\n' +
-                '📊 Pimino: ' + result.pimino_score + '\n' +
-                (result.affected_assets?.length ? '💹 Assets: <b>' + result.affected_assets.join(', ') + '</b>\n' : '') +
-                '💡 ' + (result.reasoning||'')
-              );
-            }
-          }
-        }).catch(() => {});
-      }
-
-      // ── Prediction markets ──
-      if (typeof checkPredictionSignals === 'function') {
-        checkPredictionSignals(title, wiki, uniq300, Math.round(score));
-      }
-
-      // ── Wikidata граф ──
-      setTimeout(() => checkWikidataGraph(title, wiki, Math.round(score)), 3000);
     }).catch(() => {
       // Fallback — записуємо без деталей
       supabaseInsert('anomalies', {
@@ -949,97 +898,23 @@ const server = http.createServer((req, res) => {
   }
 
 
-  // ── /wikidata — Wikidata граф пов'язаних entities ──
-  if (req.url.startsWith('/wikidata?')) {
-    const q = new URLSearchParams(req.url.split('?')[1]||'').get('title') || '';
-    if (!q) { res.writeHead(400, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'}); res.end('{}'); return; }
-
-    const cached = getCached('wikidata:'+q);
-    if (cached) {
-      res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
-      res.end(cached);
-      return;
-    }
-
-    // Крок 1: знайти Wikidata QID для title
-    const searchUrl = 'https://www.wikidata.org/w/api.php?action=wbsearchentities&search='
-      + encodeURIComponent(q) + '&language=en&limit=1&format=json';
-
-    https.get(searchUrl, { headers: { 'User-Agent': 'ResonanceBot/1.0' } }, (r) => {
-      let raw = ''; r.on('data', d => raw += d);
-      r.on('end', async () => {
-        try {
-          const data = JSON.parse(raw);
-          const entity = data.search?.[0];
-          if (!entity?.id) {
-            const empty = JSON.stringify({ title: q, qid: null, nodes: [] });
-            res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
-            res.end(empty);
-            return;
-          }
-          const qid = entity.id;
-
-          // Крок 2: SPARQL — тягнемо пов'язані entities
-          const sparql = `SELECT ?rel ?relLabel ?related ?relatedLabel WHERE {
-  VALUES ?item { wd:${qid} }
-  VALUES ?rel {
-    wdt:P131 wdt:P17 wdt:P571 wdt:P159 wdt:P749
-    wdt:P169 wdt:P127 wdt:P355 wdt:P452 wdt:P1056
-    wdt:P137 wdt:P199 wdt:P740 wdt:P1366 wdt:P1365
+  // /predictions endpoint
+  if (req.url === '/predictions') {
+    res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+    res.end(JSON.stringify({ items: predCache.items, fetchedAt: predCache.fetchedAt, count: predCache.items.length }));
+    return;
   }
-  ?item ?rel ?related .
-  ?related rdfs:label ?relatedLabel FILTER(LANG(?relatedLabel)='en') .
-  ?relProp wikibase:directClaim ?rel ; rdfs:label ?relLabel FILTER(LANG(?relLabel)='en') .
-} LIMIT 30`;
 
-          const sparqlUrl = 'https://query.wikidata.org/sparql?query=' + encodeURIComponent(sparql) + '&format=json';
-
-          https.get(sparqlUrl, {
-            headers: { 'User-Agent': 'ResonanceBot/1.0', 'Accept': 'application/json' }
-          }, (r2) => {
-            let raw2 = ''; r2.on('data', d => raw2 += d);
-            r2.on('end', () => {
-              try {
-                const sparqlData = JSON.parse(raw2);
-                const bindings = sparqlData.results?.bindings || [];
-                const nodes = bindings.map(b => ({
-                  relation: b.relLabel?.value || '',
-                  title: b.relatedLabel?.value || '',
-                  qid: b.related?.value?.split('/').pop() || ''
-                })).filter(n => n.title && n.title !== q);
-
-                // Дедуп
-                const seen = new Set();
-                const unique = nodes.filter(n => {
-                  if (seen.has(n.title)) return false;
-                  seen.add(n.title);
-                  return true;
-                });
-
-                console.log('Wikidata graph:', q, '| QID:', qid, '| nodes:', unique.length);
-                const result = JSON.stringify({ title: q, qid, nodes: unique, fetchedAt: Date.now() });
-                setCache('wikidata:'+q, result);
-                res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
-                res.end(result);
-              } catch(e) {
-                console.log('Wikidata SPARQL error:', e.message);
-                res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
-                res.end(JSON.stringify({ title: q, qid, nodes: [], error: e.message }));
-              }
-            });
-          }).on('error', e => {
-            res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
-            res.end(JSON.stringify({ title: q, qid, nodes: [], error: e.message }));
-          });
-
-        } catch(e) {
-          res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
-          res.end(JSON.stringify({ title: q, qid: null, nodes: [], error: e.message }));
-        }
-      });
-    }).on('error', e => {
+  // /sec endpoint
+  if (req.url.startsWith('/sec')) {
+    const params = new URLSearchParams(req.url.split('?')[1]||'');
+    if (params.get('refresh') === '1') secCache.fetchedAt = 0;
+    fetchSecFilings('S-1,S-1/A,8-K,SC 13D,425,DEFM14A').then(items => {
       res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
-      res.end(JSON.stringify({ title: q, qid: null, nodes: [] }));
+      res.end(JSON.stringify({ items, fetchedAt: secCache.fetchedAt, count: items.length }));
+    }).catch(() => {
+      res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+      res.end(JSON.stringify({ items: [], count: 0 }));
     });
     return;
   }
@@ -1200,14 +1075,12 @@ function connectGlobalUpstream() {
             if ((data.type === 'edit' || data.type === 'new') &&
                 ALL_WIKIS.has(data.wiki) &&
                 data.title && !data.title.includes(':')) {
-              const comment = data.comment || data.parsedcomment || '';
-              checkAnomaly(data.title, data.wiki, data.user, data.bot, comment);
+              checkAnomaly(data.title, data.wiki, data.user, data.bot);
               const msg = 'data: ' + JSON.stringify({
                 title: data.title, wiki: data.wiki,
                 user: data.user, bot: data.bot,
                 type: data.type, timestamp: data.timestamp,
-                tier: getTier(data.wiki),
-                comment: comment.slice(0, 100)
+                tier: getTier(data.wiki)
               }) + '\n\n';
               // Broadcast to all connected clients
               sseClients.forEach(client => {
@@ -1235,200 +1108,208 @@ function connectGlobalUpstream() {
 
 // Start global Wikipedia upstream immediately on launch
 
-// ── EDITOR ACTIVITY LOG + OVERLAP DETECTION ──
-const editorLog = {}; // editor -> [{title, wiki, ts}] — in-memory за останні 24г
+// ════════════════════════════════════════
+// PREDICTION MARKETS
+// ════════════════════════════════════════
 
-function logEditor(editor, title, wiki, lang, comment) {
-  if (!editor || looksLikeBot(editor, false)) return;
-  const now = Date.now();
+let predCache = { items: [], fetchedAt: 0 };
 
-  // In-memory лог
-  if (!editorLog[editor]) editorLog[editor] = [];
-  editorLog[editor].push({ title, wiki, ts: now });
-  // Чистимо старіші 24г
-  editorLog[editor] = editorLog[editor].filter(e => now - e.ts < 86400000);
-
-  // Пишемо в Supabase (тільки named users, не IP)
-  if (!/^d+.d+/.test(editor) && !editor.startsWith('~')) {
-    supabaseInsert('editor_activity', {
-      editor: editor.slice(0, 100),
-      title: title.slice(0, 200),
-      wiki,
-      lang,
-      comment: (comment||'').slice(0, 100)
-    });
-  }
-
-  // Перевіряємо overlap — чи редагував цей editor інші статті за останні 6г
-  const recent = editorLog[editor].filter(e => now - e.ts < 21600000 && e.title !== title);
-  if (recent.length >= 1) {
-    const otherTitles = [...new Set(recent.map(e => e.title))];
-    // Перетин сигнал — тільки якщо обидві статті мали аномалії
-    otherTitles.forEach(otherTitle => {
-      const otherKey = Object.keys(anomWindow).find(k => k.includes(':' + otherTitle));
-      const thisKey = wiki + ':' + title;
-      if (otherKey && anomWindow[thisKey] && anomWindow[otherKey]) {
-        const otherEditors = anomWindow[otherKey].users300?.size || 0;
-        const thisEditors = anomWindow[thisKey].users300?.size || 0;
-        if (otherEditors >= 2 && thisEditors >= 2) {
-          console.log('EDITOR OVERLAP:', editor, '|', title, '<->', otherTitle);
-          supabaseInsert('cross_signals', {
-            type: 'EDITOR+OVERLAP',
-            title: title + ' ↔ ' + otherTitle,
-            detail: 'editor: ' + editor + ' · редагував обидві статті за 6г',
-            wiki_title: title,
-            crypto_symbol: null,
-            score: 60
-          }, 'title,type');
-        }
-      }
-    });
-  }
-}
-
-// Чистимо editorLog кожні 6г
-setInterval(() => {
-  const now = Date.now();
-  Object.keys(editorLog).forEach(e => {
-    editorLog[e] = editorLog[e].filter(x => now - x.ts < 86400000);
-    if (!editorLog[e].length) delete editorLog[e];
-  });
-}, 21600000);
-
-
-// ── WIKIDATA GRAPH CHECK — перевірка кіл хвилі ──
-async function checkWikidataGraph(title, wiki, score) {
-  if (score < 40) return; // тільки для значимих аномалій
-
-  try {
-    // Тягнемо граф через власний endpoint
-    const searchUrl = 'https://www.wikidata.org/w/api.php?action=wbsearchentities&search='
-      + encodeURIComponent(title) + '&language=en&limit=1&format=json';
-
-    const qidData = await new Promise((resolve) => {
-      https.get(searchUrl, { headers: { 'User-Agent': 'ResonanceBot/1.0' } }, (r) => {
-        let raw = ''; r.on('data', d => raw += d);
-        r.on('end', () => { try { resolve(JSON.parse(raw)); } catch(e) { resolve({}); } });
-      }).on('error', () => resolve({}));
-    });
-
-    const qid = qidData.search?.[0]?.id;
-    if (!qid) return;
-
-    // Спрощений SPARQL — тільки найближчі зв'язки
-    const sparql = `SELECT ?relatedLabel WHERE {
-  VALUES ?item { wd:${qid} }
-  VALUES ?rel { wdt:P749 wdt:P355 wdt:P452 wdt:P137 wdt:P1366 wdt:P1365 wdt:P169 }
-  ?item ?rel ?related .
-  ?related rdfs:label ?relatedLabel FILTER(LANG(?relatedLabel)='en') .
-} LIMIT 15`;
-
-    const sparqlUrl = 'https://query.wikidata.org/sparql?query=' + encodeURIComponent(sparql) + '&format=json';
-
-    const sparqlData = await new Promise((resolve) => {
-      https.get(sparqlUrl, {
-        headers: { 'User-Agent': 'ResonanceBot/1.0', 'Accept': 'application/json' }
-      }, (r) => {
-        let raw = ''; r.on('data', d => raw += d);
-        r.on('end', () => { try { resolve(JSON.parse(raw)); } catch(e) { resolve({}); } });
-      }).on('error', () => resolve({}));
-    });
-
-    const nodes = (sparqlData.results?.bindings || [])
-      .map(b => b.relatedLabel?.value)
-      .filter(Boolean);
-
-    if (!nodes.length) return;
-
-    // Перевіряємо чи є ці вузли в аномWindow (активні прямо зараз)
-    const activeNodes = nodes.filter(nodeTitle => {
-      return Object.keys(anomWindow).some(k => {
-        const t = k.split(':').slice(1).join(':').toLowerCase();
-        return t === nodeTitle.toLowerCase() && anomWindow[k].ts300.length >= 2;
-      });
-    });
-
-    if (activeNodes.length > 0) {
-      console.log('GRAPH SIGNAL:', title, '| active nodes:', activeNodes.join(', '));
-      supabaseInsert('cross_signals', {
-        type: 'WIKI+GRAPH',
-        title: title,
-        detail: 'активні вузли: ' + activeNodes.join(', ') + ' · QID: ' + qid,
-        wiki_title: title,
-        crypto_symbol: null,
-        score: score + activeNodes.length * 20
-      }, 'title,type');
-
-      if (TELEGRAM_TOKEN && activeNodes.length >= 2) {
-        sendTelegram(
-          '🕸 <b>Graph Signal: ' + title + '</b>\n\n' +
-          'Wikidata граф активний:\n' +
-          activeNodes.map(n => '• ' + n).join('\n') + '\n\n' +
-          '📊 ' + activeNodes.length + ' повязаних статей редагуються одночасно'
-        );
-      }
-    }
-  } catch(e) {
-    console.log('Graph check error:', e.message);
-  }
-}
-
-
-// ── GROQ LLM — семантична класифікація Wikipedia коментарів ──
-const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
-const GROQ_MODEL = 'llama-3.3-70b-versatile';
-const groqCache = new Map();
-
-async function classifyWithGroq(comments, title, wiki) {
-  if (!GROQ_API_KEY) return null;
-  const unique = [...new Set((comments||[]).filter(c => c && c.length > 5))].slice(0, 5);
-  if (!unique.length) return null;
-
-  const cacheKey = title + '|' + unique.join('|');
-  if (groqCache.has(cacheKey)) return groqCache.get(cacheKey);
-
-  const prompt = `You are a financial signal detector analyzing Wikipedia edit comments.
-Article: "${title}" (${wiki})
-Recent edit comments:
-${unique.map((c,i) => `${i+1}. "${c}"`).join('\n')}
-
-Respond ONLY with valid JSON, no markdown:
-{"event_type":"IPO|CRISIS|MILESTONE|DEATH|CORPORATE|GEOPOLITICAL|CRYPTO|NOISE","signal_strength":0.0,"affected_assets":[],"direction":"LONG|SHORT|STRADDLE|WATCH|NONE","pimino_score":0.0,"keywords":[],"reasoning":"one sentence max"}`;
-
+async function fetchPolymarketDirect() {
   return new Promise((resolve) => {
-    const body = JSON.stringify({
-      model: GROQ_MODEL, max_tokens: 250, temperature: 0.1,
-      messages: [{ role: 'user', content: prompt }]
-    });
-    const req = https.request({
-      hostname: 'api.groq.com',
-      path: '/openai/v1/chat/completions',
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': 'Bearer ' + GROQ_API_KEY,
-        'Content-Length': Buffer.byteLength(body)
-      }
+    https.get({
+      hostname: 'gamma-api.polymarket.com',
+      path: '/markets?closed=false&limit=100&order=volumeNum&ascending=false',
+      headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' }
     }, (res) => {
-      let data = ''; res.on('data', c => data += c);
+      let raw = ''; res.on('data', d => raw += d);
+      res.on('end', () => {
+        if (raw.startsWith('<!DOCTYPE') || raw.startsWith('<html')) { resolve([]); return; }
+        try {
+          const data = JSON.parse(raw);
+          const items = (Array.isArray(data) ? data : []).map(m => {
+            let prob = null;
+            try { prob = parseFloat(JSON.parse(m.outcomePrices||'[]')[0]||0); } catch(e) {}
+            return { source:'polymarket', id:'pm_'+(m.id||''), title:m.question||'', probability:prob,
+              volume:Math.round((m.volumeNum||0)/1000), url:'https://polymarket.com/event/'+(m.slug||''),
+              categories:'', activity:m.volumeNum||0, closeTime:m.endDateIso||null };
+          }).filter(q=>q.title);
+          console.log('Polymarket:', items.length, 'markets');
+          resolve(items);
+        } catch(e) { resolve([]); }
+      });
+    }).on('error', () => resolve([]));
+  });
+}
+
+async function fetchManifold() {
+  return new Promise((resolve) => {
+    https.get({
+      hostname: 'api.manifold.markets',
+      path: '/v0/markets?limit=50&sort=last-bet-time',
+      headers: { 'User-Agent': 'ResonanceBot/1.0', 'Accept': 'application/json' }
+    }, (res) => {
+      let raw = ''; res.on('data', d => raw += d);
       res.on('end', () => {
         try {
-          const json = JSON.parse(data);
-          if (json.error) { console.log('Groq error:', json.error.message?.slice(0,60)); resolve(null); return; }
-          const text = json.choices?.[0]?.message?.content || '{}';
-          const result = JSON.parse(text.replace(/```json|```/g, '').trim());
-          groqCache.set(cacheKey, result);
-          setTimeout(() => groqCache.delete(cacheKey), 1800000);
-          console.log('Groq:', title, '| type:', result.event_type, '| strength:', result.signal_strength, '| assets:', (result.affected_assets||[]).join(','));
-          resolve(result);
-        } catch(e) { console.log('Groq parse error:', e.message); resolve(null); }
+          const data = JSON.parse(raw);
+          if (!Array.isArray(data)) { resolve([]); return; }
+          const items = data.map(q => ({
+            source:'manifold', id:'mf_'+q.id, title:q.question||'',
+            probability:q.probability||null, volume:Math.round(q.volume||0),
+            url:q.url||'https://manifold.markets/'+q.id,
+            categories:(q.tags||[]).join(','), activity:q.volume||0,
+            closeTime:q.closeTime?new Date(q.closeTime).toISOString():null
+          })).filter(q=>q.title);
+          console.log('Manifold:', items.length, 'markets');
+          resolve(items);
+        } catch(e) { resolve([]); }
       });
-    });
-    req.on('error', () => resolve(null));
-    req.setTimeout(8000, () => { req.destroy(); resolve(null); });
-    req.write(body); req.end();
+    }).on('error', () => resolve([]));
   });
 }
+
+async function fetchPredictIt() {
+  return new Promise((resolve) => {
+    https.get({
+      hostname: 'www.predictit.org',
+      path: '/api/marketdata/all/',
+      headers: { 'User-Agent': 'ResonanceBot/1.0', 'Accept': 'application/json' }
+    }, (res) => {
+      let raw = ''; res.on('data', d => raw += d);
+      res.on('end', () => {
+        try {
+          const data = JSON.parse(raw);
+          const items = (data.markets||[]).map(m => {
+            const contracts = m.contracts||[];
+            const top = contracts.sort((a,b)=>(b.volume||0)-(a.volume||0))[0];
+            const prob = top?(top.lastTradePrice||top.bestYesPrice||null):null;
+            return { source:'predictit', id:'pi_'+m.id, title:m.name||'', probability:prob,
+              volume:contracts.reduce((s,c)=>s+(c.volume||0),0),
+              url:m.url||'https://www.predictit.org/markets/detail/'+m.id,
+              categories:'', activity:m.dateEndKnown?1:0, closeTime:m.timeStamp||null };
+          }).filter(q=>q.title);
+          console.log('PredictIt:', items.length, 'markets');
+          resolve(items);
+        } catch(e) { resolve([]); }
+      });
+    }).on('error', () => resolve([]));
+  });
+}
+
+async function fetchAllPredictions() {
+  const now = Date.now();
+  if (now - predCache.fetchedAt < 600000 && predCache.items.length) return predCache.items;
+  const [poly, manifold, predictit] = await Promise.all([fetchPolymarketDirect(), fetchManifold(), fetchPredictIt()]);
+  const all = [...poly, ...manifold, ...predictit];
+  predCache = { items: all, fetchedAt: now };
+  console.log('Predictions total:', all.length);
+  return all;
+}
+
+function checkPredictionSignals(title, wiki, editors, score) {
+  if (editors < 2) return;
+  fetchAllPredictions().then(predictions => {
+    const words = title.toLowerCase().split(/[\s,.-]+/).filter(w=>w.length>3);
+    const matches = predictions.filter(p => {
+      const t = (p.title||'').toLowerCase();
+      const cnt = words.filter(w=>t.includes(w)).length;
+      return cnt >= 2 || words.some(w=>w.length>6&&t.includes(w));
+    }).slice(0,3);
+    matches.forEach(match => {
+      const prob = match.probability !== null ? Math.round(match.probability*100) : null;
+      supabaseInsert('cross_signals', {
+        type: 'WIKI+PREDICT', title,
+        detail: (prob!==null?'YES:'+prob+'% ':'')+'vol:'+(match.volume>1000?Math.round(match.volume/1000)+'K':match.volume)+' '+match.source.toUpperCase()+' · '+match.title.slice(0,80),
+        wiki_title: title, crypto_symbol: null,
+        score: Math.round(score * (prob||50)/100),
+        source_url: match.url
+      });
+    });
+  }).catch(()=>{});
+}
+
+fetchAllPredictions();
+setInterval(fetchAllPredictions, 600000);
+
+
+// ════════════════════════════════════════
+// SEC EDGAR
+// ════════════════════════════════════════
+
+let secCache = { items: [], fetchedAt: 0 };
+
+const EIGHT_K_ITEMS = {
+  '1.01':{ label:'M&A угода', score:80, emoji:'💼' },
+  '1.03':{ label:'Банкрутство', score:90, emoji:'💥' },
+  '2.04':{ label:'Дефолт', score:85, emoji:'🔴' },
+  '5.02':{ label:'Зміна CEO/CFO', score:70, emoji:'👤' },
+  '7.01':{ label:'Прес-реліз', score:30, emoji:'📢' },
+  '8.01':{ label:'Інше', score:20, emoji:'📄' },
+};
+
+const SEC_FORMS = {
+  'S-1':{ label:'IPO', emoji:'🚀', score:80 },
+  'S-1/A':{ label:'IPO amend', emoji:'🚀', score:40 },
+  '8-K':{ label:'Подія', emoji:'⚡', score:60 },
+  'SC 13D':{ label:'Акціонер', emoji:'🎯', score:50 },
+  '425':{ label:'M&A', emoji:'💼', score:70 },
+  'DEFM14A':{ label:'Merger', emoji:'💼', score:75 },
+};
+
+async function fetchSecFilings(forms) {
+  const now = Date.now();
+  if (now - secCache.fetchedAt < 300000 && secCache.items.length) return secCache.items;
+  const today = new Date().toISOString().slice(0,10);
+  const yesterday = new Date(now-86400000).toISOString().slice(0,10);
+  const formList = forms || Object.keys(SEC_FORMS).join(',');
+  return new Promise((resolve) => {
+    const path = '/LATEST/search-index?forms='+encodeURIComponent(formList)
+      +'&dateRange=custom&startdt='+yesterday+'&enddt='+today
+      +'&_source=file_date,display_names,period_ending,file_num,root_forms,biz_states,items&from=0&size=100';
+    https.get({
+      hostname: 'efts.sec.gov', path,
+      headers: { 'User-Agent': 'ResonanceBot/1.0 contact@resonance.app', 'Accept': 'application/json' }
+    }, (res) => {
+      let raw = ''; res.on('data', d => raw += d);
+      res.on('end', () => {
+        try {
+          const data = JSON.parse(raw);
+          const seen = new Set();
+          const items = [];
+          for (const hit of (data.hits?.hits||[])) {
+            const s = hit._source;
+            const nameRaw = s.display_names?.[0]||'';
+            const company = nameRaw.split('(')[0].trim();
+            const tickerM = nameRaw.match(/\(([A-Z0-9]{1,5})\)/);
+            const ticker = tickerM?tickerM[1]:'';
+            const form = s.root_forms?.[0]||'';
+            const key = company+':'+form;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            let meta = SEC_FORMS[form]||{ label:form, emoji:'📄', score:20 };
+            const itemTypes = s.items||[];
+            if (form==='8-K' && itemTypes.length) {
+              const best = itemTypes.map(it=>EIGHT_K_ITEMS[it]||{label:it,score:0,emoji:'📄'}).sort((a,b)=>b.score-a.score)[0];
+              if (best.score < 40) { seen.delete(key); continue; }
+              meta = {...meta, label:best.label, emoji:best.emoji, score:Math.max(meta.score,best.score)};
+            }
+            items.push({ company:company.slice(0,60), ticker, form, label:meta.label, emoji:meta.emoji,
+              score:meta.score, state:s.biz_states?.[0]||'', date:s.file_date,
+              url:'https://www.sec.gov/cgi-bin/browse-edgar?company='+encodeURIComponent(company.replace(/[,.]/g,'').trim())+'&CIK=&type='+encodeURIComponent(form)+'&dateb=&owner=include&count=10&search_text=&action=getcompany',
+              itemTypes });
+          }
+          items.sort((a,b)=>b.score-a.score);
+          secCache = { items, fetchedAt: now };
+          console.log('SEC updated:', items.length, 'filings');
+          resolve(items);
+        } catch(e) { console.log('SEC parse error:', e.message); resolve([]); }
+      });
+    }).on('error', e => { console.log('SEC fetch error:', e.message); resolve([]); });
+  });
+}
+
+fetchSecFilings();
+setInterval(fetchSecFilings, 900000);
 
 connectGlobalUpstream();
 
