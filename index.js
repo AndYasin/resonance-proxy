@@ -959,6 +959,15 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+
+  // /history/run — ручний запуск history batch
+  if (req.url === '/history/run') {
+    runHistoryBatch();
+    res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+    res.end(JSON.stringify({ status: 'running', message: 'history batch started' }));
+    return;
+  }
+
   // /ping endpoint — keepalive
   if (req.url === '/ping') {
     res.writeHead(200, { 'Content-Type': 'text/plain', 'Access-Control-Allow-Origin': '*' });
@@ -1565,6 +1574,172 @@ Additional rules:
 buildDailyDigest();
 setInterval(buildDailyDigest, 21600000);
 
+
+// ════════════════════════════════════════
+// WIKIPEDIA HISTORY BATCH — нічний аналіз
+// Визначає BRANCH (підготовка) vs FLY (реакція)
+// ════════════════════════════════════════
+
+async function analyzeHistoryPattern(title, lang, editors, score) {
+  if (!GROQ_API_KEY) return null;
+
+  // Тягнемо revision history за 30 днів через Vercel /api/retro
+  const today = new Date().toISOString().slice(0,10);
+  const retroUrl = 'https://resonance-dashboard-7a1u.vercel.app/api/retro?title='
+    + encodeURIComponent(title) + '&event=' + today + '&lang=' + (lang||'en') + '&days=30';
+
+  const retroData = await new Promise((resolve) => {
+    https.get(retroUrl, { headers: { 'User-Agent': 'ResonanceBot/1.0' } }, (r) => {
+      let raw = ''; r.on('data', d => raw += d);
+      r.on('end', () => { try { resolve(JSON.parse(raw)); } catch(e) { resolve(null); } });
+    }).on('error', () => resolve(null));
+  });
+
+  if (!retroData?.found || !retroData.timeline?.length) return null;
+
+  // Будуємо контекст для Groq
+  const tl = retroData.timeline;
+  const timelineStr = tl.map(d =>
+    `T${d.t>0?'+':''}${d.t}д: ${d.edits}правок ${d.editors}ред ${d.signal!=='none'?'['+d.signal+']':''} ${d.comments?.slice(0,2).join(' | ')||''}`
+  ).join('\n');
+
+  const firstSignal = retroData.firstSignal;
+
+  const prompt = `You are analyzing Wikipedia edit patterns to determine if this is a BRANCH (preparation before event) or FLY (reaction to already-happened event).
+
+Article: "${title}" (editors today: ${editors}, score: ${score})
+First anomalous signal: ${firstSignal ? 'T' + firstSignal.t + ' days, ' + firstSignal.signal : 'none'}
+
+30-day edit timeline (T=0 is today):
+${timelineStr}
+
+Analyze the pattern:
+- BRANCH: activity INCREASES in days BEFORE today (T-3 to T-1), suggests event is COMING
+- FLY: activity SPIKES at T0 or after, suggests event ALREADY HAPPENED and people are reacting
+- SUSTAINED: steady high activity over many days, suggests ongoing situation
+
+Also determine:
+- lead_time: how many days before today the signal started (negative = days ago)
+- confidence: 0.0-1.0 how confident you are in the pattern
+- next_72h: what likely happens in next 72 hours
+
+Respond ONLY with valid JSON:
+{"pattern":"BRANCH|FLY|SUSTAINED","lead_time":-3,"confidence":0.8,"reasoning":"one sentence","next_72h":"brief prediction","signal_quality":"STRONG|MED|WEAK"}`;
+
+  return new Promise((resolve) => {
+    const body = JSON.stringify({
+      model: GROQ_MODEL, max_tokens: 300, temperature: 0.1,
+      messages: [{ role: 'user', content: prompt }]
+    });
+    const req = https.request({
+      hostname: 'api.groq.com', path: '/openai/v1/chat/completions', method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + GROQ_API_KEY,
+        'Content-Length': Buffer.byteLength(body)
+      }
+    }, (res) => {
+      let data = ''; res.on('data', c => data += c);
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(data);
+          if (json.error) { resolve(null); return; }
+          const text = json.choices?.[0]?.message?.content || '{}';
+          const result = JSON.parse(text.replace(/```json|```/g,'').trim());
+          console.log('History pattern:', title, '|', result.pattern, '| conf:', result.confidence, '| lead:', result.lead_time);
+          resolve(result);
+        } catch(e) { resolve(null); }
+      });
+    });
+    req.on('error', () => resolve(null));
+    req.setTimeout(10000, () => { req.destroy(); resolve(null); });
+    req.write(body); req.end();
+  });
+}
+
+async function runHistoryBatch() {
+  if (!GROQ_API_KEY) return;
+  console.log('Running history batch...');
+
+  try {
+    // Беремо топ-10 аномалій за тиждень
+    const since = new Date(Date.now() - 7 * 86400000).toISOString();
+    const url = SUPABASE_URL + '/rest/v1/anomalies?created_at=gte.' + since
+      + '&order=score.desc&limit=10';
+
+    const anomalies = await new Promise((resolve) => {
+      https.get(url, {
+        headers: { 'apikey': SUPABASE_KEY, 'Authorization': 'Bearer ' + SUPABASE_KEY }
+      }, (r) => {
+        let d = ''; r.on('data', c => d += c);
+        r.on('end', () => { try { resolve(JSON.parse(d)); } catch(e) { resolve([]); } });
+      }).on('error', () => resolve([]));
+    });
+
+    if (!Array.isArray(anomalies) || !anomalies.length) return;
+
+    const results = [];
+
+    for (const anom of anomalies.slice(0, 10)) {
+      // Затримка між запитами щоб не вичерпати Groq rate limit
+      await new Promise(r => setTimeout(r, 2000));
+
+      const pattern = await analyzeHistoryPattern(anom.title, anom.lang, anom.editors, anom.score);
+      if (!pattern) continue;
+
+      results.push({ title: anom.title, ...pattern });
+
+      // Зберігаємо в cross_signals
+      supabaseInsert('cross_signals', {
+        type: 'WIKI+HISTORY',
+        title: anom.title,
+        detail: pattern.pattern + ' · lead:' + pattern.lead_time + 'д · conf:' + pattern.confidence
+          + ' · ' + pattern.reasoning
+          + ' · next72h: ' + (pattern.next_72h||''),
+        wiki_title: anom.title,
+        crypto_symbol: null,
+        score: Math.round(pattern.confidence * 80)
+      }, 'title,type');
+
+      // Telegram для BRANCH з високою впевненістю
+      if (pattern.pattern === 'BRANCH' && pattern.confidence >= 0.7 && TELEGRAM_TOKEN) {
+        sendTelegram(
+          '🌿 <b>BRANCH Signal: ' + anom.title + '</b>\n\n' +
+          '📅 Перший сигнал: T' + pattern.lead_time + ' днів\n' +
+          '💡 ' + pattern.reasoning + '\n' +
+          '🔮 Наступні 72г: ' + (pattern.next_72h||'невідомо') + '\n' +
+          '📊 Впевненість: ' + Math.round(pattern.confidence*100) + '%'
+        );
+      }
+    }
+
+    console.log('History batch done:', results.length, 'analyzed');
+
+    // Оновлюємо daily digest після batch
+    if (results.length) buildDailyDigest();
+
+  } catch(e) {
+    console.log('History batch error:', e.message);
+  }
+}
+
+// Запускаємо щоночі о 2:00 UTC
+function scheduleHistoryBatch() {
+  const now = new Date();
+  const next2am = new Date(now);
+  next2am.setUTCHours(2, 0, 0, 0);
+  if (next2am <= now) next2am.setUTCDate(next2am.getUTCDate() + 1);
+  const msUntil = next2am - now;
+  console.log('History batch scheduled in', Math.round(msUntil/3600000), 'hours');
+  setTimeout(() => {
+    runHistoryBatch();
+    setInterval(runHistoryBatch, 86400000); // потім кожні 24г
+  }, msUntil);
+}
+
+scheduleHistoryBatch();
+
+// Також /history/run для ручного запуску
 connectGlobalUpstream();
 
 server.listen(process.env.PORT || 3000, '0.0.0.0', () => {
@@ -1573,14 +1748,25 @@ server.listen(process.env.PORT || 3000, '0.0.0.0', () => {
   console.log('TG thresholds — Tier1: 4+ editors | Tier2: 5+ editors | Tier3: 6+ editors');
   if (TELEGRAM_TOKEN) {
     sendTelegram(
-      '🟢 <b>Resonance v5 запущено</b>\n\n' +
-      '📡 Wikipedia + GitHub + Binance\n' +
-      '📡 Мов: ' + ALL_WIKIS.size + ' (en/de/fr/es/ru/ja/zh + ar/fa/ta/hi + 19 інших)\n\n' +
-      '⚙️ Пороги Telegram:\n' +
-      '🔵 Tier 1 (en/de/fr/es...): 4+ редактори / 5 хв\n' +
-      '🟡 Tier 2 (uk/ar/fa/tr...): 5+ редактори / 5 хв\n' +
-      '🔴 Tier 3 (ta/hi/he...): 6+ редактори / 5 хв\n\n' +
-      '📌 Тільки важливі типи: смерть, політик, бізнес, геополітика, глобальні статті (30+ мов)'
+      '🟢 <b>RESONANCE v7 online</b>\n\n' +
+      '📡 ' + ALL_WIKIS.size + ' Wikipedia мов · real-time\n\n' +
+      '<b>Що надсилаю:</b>\n' +
+      '⚡ <b>WIKI ALERT</b> — 5+ редакторів / 5хв (tier1), важливий тип або 30+ мов\n' +
+      '🔮 <b>LLM Signal</b> — Groq класифікував з confidence >= 0.8\n' +
+      '📊 <b>Daily Digest</b> — топ сигнали 2x на добу (6:00 і 18:00 UTC)\n' +
+      '🌿 <b>BRANCH</b> — history batch виявив підготовку до події (T-X днів)\n' +
+      '🕸 <b>Graph Signal</b> — 2+ пов\'язаних Wikidata вузли активні одночасно\n' +
+      '📈 <b>Trends</b> — Wikipedia burst + Google Trends в 2+ країнах\n\n' +
+      '<b>Не надсилаю:</b> спорт без macro impact, culture, Wikipedia routine\n\n' +
+      '<b>Як читати LLM сигнал:</b>\n' +
+      'strength — впевненість Groq (0-1)\n' +
+      'pimino — потенціал поширення події (0-1)\n' +
+      'assets — конкретні тікери/валюти\n' +
+      'direction — LONG/SHORT/STRADDLE/WATCH\n\n' +
+      '<b>BRANCH vs FLY:</b>\n' +
+      '🌿 BRANCH = подія готується, є T-X сигнал → можна діяти до\n' +
+      '🪰 FLY = подія вже сталась, реакція ринку → моментум або запізно\n\n' +
+      '⚙️ Tier1 (en/de/fr): 5+ ред · Tier2 (uk/ar): 6+ · Tier3 (hi/he): 7+'
     );
   }
 });
