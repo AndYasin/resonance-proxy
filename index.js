@@ -1446,26 +1446,39 @@ async function buildDailyDigest() {
       return `- "${a.title}" | type:${a.article_type||'?'} | editors:${a.editors} | score:${a.score} | signals:[${signals.join(',')||'none'}] | keywords:${a.comment_keywords||''}`;
     }).join('\n');
 
-    const prompt = `You are a financial intelligence analyst. Based on Wikipedia anomaly data from the last 24 hours, identify the 7-10 most significant signals.
+    const prompt = `You are a financial intelligence analyst specializing in event-driven trading signals. Analyze Wikipedia anomaly data and identify ONLY signals with real financial market impact.
 
-ANOMALY DATA:
+ANOMALY DATA (format: title | type | editors | score | cross-signals | keywords):
 ${anomContext}
 
-For each signal, determine:
-- pattern: ELECTION_PREP | IPO_PREP | CRISIS | CORPORATE_CHANGE | GEOPOLITICAL | MARKET_MOVE | DEATH | NOISE
-- urgency: URGENT | HIGH | MEDIUM | LOW
-- signals array: which independent sources confirm it
-- affected_assets: stock tickers, currencies, commodities
-- reasoning: one clear sentence why this matters financially
+STRICT INCLUSION CRITERIA — include ONLY if at least one applies:
+1. IPO/listing/funding round preparation (keywords: IPO, S-1, listing, offering, funding)
+2. Corporate crisis: bankruptcy, fraud, CEO change, M&A, acquisition
+3. Geopolitical event affecting markets: election results, sanctions, military conflict, coup
+4. Death/health crisis of a major political or business leader (50+ language Wikipedia)
+5. Regulatory/legal action affecting a public company or sector
+6. Macro event: central bank decision, major economic data, trade deal
 
-Respond ONLY with valid JSON array, no markdown:
+STRICT EXCLUSION — never include:
+- Sports results, championships, player statistics
+- Historical figures without current relevance
+- Local/regional elections with no macro impact
+- Entertainment, culture, music awards
+- Academic or scientific topics without market relevance
+- Wikipedia maintenance edits (REVERT signals only)
+
+For each included signal:
+- pattern: IPO_PREP | CRISIS | CORPORATE_CHANGE | GEOPOLITICAL | REGULATORY | MACRO | DEATH
+- urgency: URGENT (act now) | HIGH (act today) | MEDIUM (watch) | LOW (monitor)
+- signals: list ONLY confirmed cross-signals from the data [WIKI+LLM, WIKI+PREDICT, EDITOR+OVERLAP, etc]
+- assets: specific tickers or currency pairs (e.g. AAPL, EUR/USD, GOLD) — NOT generic "stocks"
+- reasoning: ONE sentence, specific, actionable — WHY this matters for markets NOW
+- convergence: count of independent confirming signals (1-7)
+
+Respond ONLY with valid JSON array. If no signals meet criteria, return []:
 [{"rank":1,"title":"...","pattern":"...","urgency":"...","signals":[],"reasoning":"...","assets":[],"convergence":3}]
 
-Rules:
-- rank by financial significance, not just Wikipedia activity
-- convergence = number of independent confirming signals (1-7)
-- only include if convergence >= 2 or urgency = URGENT
-- max 10 items`;
+Maximum 7 items. Quality over quantity.`;
 
     // 4. Відправляємо в Groq
     const result = await new Promise((resolve) => {
