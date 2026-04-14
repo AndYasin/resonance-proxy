@@ -1123,7 +1123,8 @@ function connectGlobalUpstream() {
             const data = JSON.parse(line.slice(6));
             if ((data.type === 'edit' || data.type === 'new') &&
                 ALL_WIKIS.has(data.wiki) &&
-                data.title && !data.title.includes(':')) {
+                data.title && !data.title.includes(':') &&
+                !/(^List of|^Deaths in|^Nekrolog|^Список|^Тисяча|^\d{4} in |^\d{4}–|^Index of|^Outline of)/i.test(data.title)) {
               checkAnomaly(data.title, data.wiki, data.user, data.bot);
               const msg = 'data: ' + JSON.stringify({
                 title: data.title, wiki: data.wiki,
