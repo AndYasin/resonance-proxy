@@ -515,6 +515,46 @@ async function checkAnomaly(title, wiki, user, isBot, comment) {
         is_trending: trendPct !== null,
         trend_pct: trendPct
       });
+
+      // ── Groq класифікація ──
+      if (w.comments.length >= 2 && uniq300 >= 2) {
+        classifyWithGroq(w.comments, title, wiki).then(result => {
+          if (!result || result.event_type === 'NOISE') return;
+          if (result.signal_strength >= 0.6) {
+            supabaseInsert('cross_signals', {
+              type: 'WIKI+LLM',
+              title,
+              detail: result.event_type + ' · strength:' + result.signal_strength
+                + ' · pimino:' + result.pimino_score
+                + ' · assets:' + (result.affected_assets||[]).join(',')
+                + ' · ' + (result.direction||'')
+                + ' · ' + (result.reasoning||'').slice(0,100),
+              wiki_title: title,
+              crypto_symbol: null,
+              score: Math.round(result.signal_strength * 100)
+            });
+            // Telegram якщо дуже сильний сигнал
+            if (result.signal_strength >= 0.8 && TELEGRAM_TOKEN) {
+              const dirEmoji = result.direction==='LONG'?'📈':result.direction==='SHORT'?'📉':result.direction==='STRADDLE'?'↕️':'🤖';
+              sendTelegram(
+                dirEmoji + ' <b>LLM Signal: ' + title + '</b>\n\n' +
+                '🔮 ' + result.event_type + ' · strength: <b>' + result.signal_strength + '</b>\n' +
+                '📊 Pimino: ' + result.pimino_score + '\n' +
+                (result.affected_assets?.length ? '💹 Assets: <b>' + result.affected_assets.join(', ') + '</b>\n' : '') +
+                '💡 ' + (result.reasoning||'')
+              );
+            }
+          }
+        }).catch(() => {});
+      }
+
+      // ── Prediction markets ──
+      if (typeof checkPredictionSignals === 'function') {
+        checkPredictionSignals(title, wiki, uniq300, Math.round(score));
+      }
+
+      // ── Wikidata граф ──
+      setTimeout(() => checkWikidataGraph(title, wiki, Math.round(score)), 3000);
     }).catch(() => {
       // Fallback — записуємо без деталей
       supabaseInsert('anomalies', {
@@ -1331,6 +1371,63 @@ async function checkWikidataGraph(title, wiki, score) {
   } catch(e) {
     console.log('Graph check error:', e.message);
   }
+}
+
+
+// ── GROQ LLM — семантична класифікація Wikipedia коментарів ──
+const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
+const GROQ_MODEL = 'llama-3.3-70b-versatile';
+const groqCache = new Map();
+
+async function classifyWithGroq(comments, title, wiki) {
+  if (!GROQ_API_KEY) return null;
+  const unique = [...new Set((comments||[]).filter(c => c && c.length > 5))].slice(0, 5);
+  if (!unique.length) return null;
+
+  const cacheKey = title + '|' + unique.join('|');
+  if (groqCache.has(cacheKey)) return groqCache.get(cacheKey);
+
+  const prompt = `You are a financial signal detector analyzing Wikipedia edit comments.
+Article: "${title}" (${wiki})
+Recent edit comments:
+${unique.map((c,i) => `${i+1}. "${c}"`).join('\n')}
+
+Respond ONLY with valid JSON, no markdown:
+{"event_type":"IPO|CRISIS|MILESTONE|DEATH|CORPORATE|GEOPOLITICAL|CRYPTO|NOISE","signal_strength":0.0,"affected_assets":[],"direction":"LONG|SHORT|STRADDLE|WATCH|NONE","pimino_score":0.0,"keywords":[],"reasoning":"one sentence max"}`;
+
+  return new Promise((resolve) => {
+    const body = JSON.stringify({
+      model: GROQ_MODEL, max_tokens: 250, temperature: 0.1,
+      messages: [{ role: 'user', content: prompt }]
+    });
+    const req = https.request({
+      hostname: 'api.groq.com',
+      path: '/openai/v1/chat/completions',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + GROQ_API_KEY,
+        'Content-Length': Buffer.byteLength(body)
+      }
+    }, (res) => {
+      let data = ''; res.on('data', c => data += c);
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(data);
+          if (json.error) { console.log('Groq error:', json.error.message?.slice(0,60)); resolve(null); return; }
+          const text = json.choices?.[0]?.message?.content || '{}';
+          const result = JSON.parse(text.replace(/```json|```/g, '').trim());
+          groqCache.set(cacheKey, result);
+          setTimeout(() => groqCache.delete(cacheKey), 1800000);
+          console.log('Groq:', title, '| type:', result.event_type, '| strength:', result.signal_strength, '| assets:', (result.affected_assets||[]).join(','));
+          resolve(result);
+        } catch(e) { console.log('Groq parse error:', e.message); resolve(null); }
+      });
+    });
+    req.on('error', () => resolve(null));
+    req.setTimeout(8000, () => { req.destroy(); resolve(null); });
+    req.write(body); req.end();
+  });
 }
 
 connectGlobalUpstream();
