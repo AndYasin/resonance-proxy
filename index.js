@@ -919,6 +919,46 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+
+  // /daily endpoint — daily signal digest
+  if (req.url === '/daily') {
+    const cached = getCached('daily');
+    if (cached) {
+      res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+      res.end(cached);
+      return;
+    }
+    // Якщо кеш порожній — повертаємо з dailyCache або тригеримо rebuild
+    if (dailyCache.items.length) {
+      const result = JSON.stringify({ items: dailyCache.items, fetchedAt: dailyCache.fetchedAt, count: dailyCache.items.length });
+      setCache('daily', result);
+      res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+      res.end(result);
+      return;
+    }
+    // Тригеримо rebuild і повертаємо порожній поки що
+    buildDailyDigest().then(items => {
+      const result = JSON.stringify({ items, fetchedAt: Date.now(), count: items.length });
+      setCache('daily', result);
+    });
+    res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+    res.end(JSON.stringify({ items: [], building: true, count: 0 }));
+    return;
+  }
+
+  // /daily/refresh — примусовий rebuild
+  if (req.url === '/daily/refresh') {
+    dailyCache.fetchedAt = 0;
+    setCache('daily', null);
+    buildDailyDigest().then(items => {
+      const result = JSON.stringify({ items, fetchedAt: Date.now(), count: items.length });
+      setCache('daily', result);
+    });
+    res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+    res.end(JSON.stringify({ status: 'building', message: 'digest is being rebuilt' }));
+    return;
+  }
+
   // /ping endpoint — keepalive
   if (req.url === '/ping') {
     res.writeHead(200, { 'Content-Type': 'text/plain', 'Access-Control-Allow-Origin': '*' });
@@ -1310,6 +1350,165 @@ async function fetchSecFilings(forms) {
 
 fetchSecFilings();
 setInterval(fetchSecFilings, 900000);
+
+
+// ════════════════════════════════════════
+// DAILY SIGNAL DIGEST
+// Запускається кожні 6г, повертає 7-10 карток
+// ════════════════════════════════════════
+
+let dailyCache = { items: [], fetchedAt: 0 };
+
+async function buildDailyDigest() {
+  console.log('Building daily digest...');
+  try {
+    // 1. Беремо топ аномалії за 24г з Supabase
+    const since = new Date(Date.now() - 86400000).toISOString();
+    const anomUrl = SUPABASE_URL + '/rest/v1/anomalies?created_at=gte.' + since
+      + '&order=score.desc&limit=30';
+    const xsUrl = SUPABASE_URL + '/rest/v1/cross_signals?created_at=gte.' + since
+      + '&order=score.desc&limit=50';
+
+    const [anomRes, xsRes] = await Promise.all([
+      new Promise((resolve) => {
+        https.get(anomUrl, {
+          headers: { 'apikey': SUPABASE_KEY, 'Authorization': 'Bearer ' + SUPABASE_KEY }
+        }, (r) => {
+          let d = ''; r.on('data', c => d += c);
+          r.on('end', () => { try { resolve(JSON.parse(d)); } catch(e) { resolve([]); } });
+        }).on('error', () => resolve([]));
+      }),
+      new Promise((resolve) => {
+        https.get(xsUrl, {
+          headers: { 'apikey': SUPABASE_KEY, 'Authorization': 'Bearer ' + SUPABASE_KEY }
+        }, (r) => {
+          let d = ''; r.on('data', c => d += c);
+          r.on('end', () => { try { resolve(JSON.parse(d)); } catch(e) { resolve([]); } });
+        }).on('error', () => resolve([]));
+      })
+    ]);
+
+    if (!Array.isArray(anomRes) || !anomRes.length) {
+      console.log('Daily digest: no anomalies found');
+      return [];
+    }
+
+    // 2. Групуємо cross signals по title
+    const xsByTitle = {};
+    if (Array.isArray(xsRes)) {
+      xsRes.forEach(xs => {
+        if (!xsByTitle[xs.wiki_title || xs.title]) xsByTitle[xs.wiki_title || xs.title] = [];
+        xsByTitle[xs.wiki_title || xs.title].push(xs.type);
+      });
+    }
+
+    // 3. Будуємо контекст для Groq
+    const anomContext = anomRes.slice(0, 20).map(a => {
+      const signals = xsByTitle[a.title] || [];
+      return `- "${a.title}" | type:${a.article_type||'?'} | editors:${a.editors} | score:${a.score} | signals:[${signals.join(',')||'none'}] | keywords:${a.comment_keywords||''}`;
+    }).join('\n');
+
+    const prompt = `You are a financial intelligence analyst. Based on Wikipedia anomaly data from the last 24 hours, identify the 7-10 most significant signals.
+
+ANOMALY DATA:
+${anomContext}
+
+For each signal, determine:
+- pattern: ELECTION_PREP | IPO_PREP | CRISIS | CORPORATE_CHANGE | GEOPOLITICAL | MARKET_MOVE | DEATH | NOISE
+- urgency: URGENT | HIGH | MEDIUM | LOW
+- signals array: which independent sources confirm it
+- affected_assets: stock tickers, currencies, commodities
+- reasoning: one clear sentence why this matters financially
+
+Respond ONLY with valid JSON array, no markdown:
+[{"rank":1,"title":"...","pattern":"...","urgency":"...","signals":[],"reasoning":"...","assets":[],"convergence":3}]
+
+Rules:
+- rank by financial significance, not just Wikipedia activity
+- convergence = number of independent confirming signals (1-7)
+- only include if convergence >= 2 or urgency = URGENT
+- max 10 items`;
+
+    // 4. Відправляємо в Groq
+    const result = await new Promise((resolve) => {
+      const body = JSON.stringify({
+        model: 'llama-3.3-70b-versatile',
+        max_tokens: 2000,
+        temperature: 0.1,
+        messages: [{ role: 'user', content: prompt }]
+      });
+      const req = https.request({
+        hostname: 'api.groq.com',
+        path: '/openai/v1/chat/completions',
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer ' + GROQ_API_KEY,
+          'Content-Length': Buffer.byteLength(body)
+        }
+      }, (res) => {
+        let data = ''; res.on('data', c => data += c);
+        res.on('end', () => {
+          try {
+            const json = JSON.parse(data);
+            if (json.error) { console.log('Groq daily error:', json.error.message?.slice(0,80)); resolve(null); return; }
+            const text = json.choices?.[0]?.message?.content || '[]';
+            const clean = text.replace(/```json|```/g, '').trim();
+            resolve(JSON.parse(clean));
+          } catch(e) { console.log('Groq daily parse error:', e.message); resolve(null); }
+        });
+      });
+      req.on('error', () => resolve(null));
+      req.setTimeout(15000, () => { req.destroy(); resolve(null); });
+      req.write(body); req.end();
+    });
+
+    if (!result || !Array.isArray(result)) return [];
+
+    console.log('Daily digest:', result.length, 'signals');
+
+    // 5. Зберігаємо в Supabase
+    result.forEach(item => {
+      supabaseInsert('daily_signals', {
+        rank: item.rank,
+        title: item.title,
+        pattern: item.pattern,
+        urgency: item.urgency,
+        signals: item.signals,
+        reasoning: item.reasoning,
+        assets: item.assets,
+        convergence: item.convergence
+      });
+    });
+
+    // 6. Telegram summary
+    if (TELEGRAM_TOKEN && result.length) {
+      const urgent = result.filter(r => r.urgency === 'URGENT' || r.urgency === 'HIGH').slice(0,3);
+      if (urgent.length) {
+        const msg = '📊 <b>Daily Digest</b> · ' + new Date().toLocaleTimeString('uk-UA', {hour:'2-digit',minute:'2-digit'}) + '\n\n'
+          + urgent.map(r => {
+            const urgEmoji = r.urgency==='URGENT'?'🔴':r.urgency==='HIGH'?'🟡':'🔵';
+            return urgEmoji + ' <b>' + r.title + '</b>\n'
+              + r.pattern + ' · conv: ' + r.convergence + '/7\n'
+              + (r.assets?.length ? '💹 ' + r.assets.join(', ') + '\n' : '')
+              + '<i>' + r.reasoning + '</i>';
+          }).join('\n\n');
+        sendTelegram(msg);
+      }
+    }
+
+    dailyCache = { items: result, fetchedAt: Date.now() };
+    return result;
+
+  } catch(e) {
+    console.log('Daily digest error:', e.message);
+    return [];
+  }
+}
+
+// Запускаємо кожні 6 годин
+buildDailyDigest();
+setInterval(buildDailyDigest, 21600000);
 
 connectGlobalUpstream();
 
