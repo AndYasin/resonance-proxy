@@ -1352,6 +1352,44 @@ fetchSecFilings();
 setInterval(fetchSecFilings, 900000);
 
 
+
+// ── GROQ LLM ──
+const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
+const GROQ_MODEL = 'llama-3.3-70b-versatile';
+const groqCache = new Map();
+
+async function classifyWithGroq(comments, title, wiki) {
+  if (!GROQ_API_KEY) return null;
+  const unique = [...new Set((comments||[]).filter(c => c && c.length > 5))].slice(0, 5);
+  if (!unique.length) return null;
+  const cacheKey = title + '|' + unique.join('|');
+  if (groqCache.has(cacheKey)) return groqCache.get(cacheKey);
+  const prompt = 'You are a financial signal detector analyzing Wikipedia edit comments.\nArticle: "' + title + '" (' + wiki + ')\nRecent edit comments:\n' + unique.map((c,i) => (i+1)+'. "'+c+'"').join('\n') + '\n\nRespond ONLY with valid JSON:\n{"event_type":"IPO|CRISIS|MILESTONE|DEATH|CORPORATE|GEOPOLITICAL|CRYPTO|NOISE","signal_strength":0.0,"affected_assets":[],"direction":"LONG|SHORT|STRADDLE|WATCH|NONE","pimino_score":0.0,"keywords":[],"reasoning":"one sentence max"}';
+  return new Promise((resolve) => {
+    const body = JSON.stringify({ model: GROQ_MODEL, max_tokens: 250, temperature: 0.1, messages: [{ role: 'user', content: prompt }] });
+    const req = https.request({
+      hostname: 'api.groq.com', path: '/openai/v1/chat/completions', method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + GROQ_API_KEY, 'Content-Length': Buffer.byteLength(body) }
+    }, (res) => {
+      let data = ''; res.on('data', c => data += c);
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(data);
+          if (json.error) { resolve(null); return; }
+          const text = json.choices?.[0]?.message?.content || '{}';
+          const result = JSON.parse(text.replace(/```json|```/g,'').trim());
+          groqCache.set(cacheKey, result);
+          setTimeout(() => groqCache.delete(cacheKey), 1800000);
+          resolve(result);
+        } catch(e) { resolve(null); }
+      });
+    });
+    req.on('error', () => resolve(null));
+    req.setTimeout(8000, () => { req.destroy(); resolve(null); });
+    req.write(body); req.end();
+  });
+}
+
 // ════════════════════════════════════════
 // DAILY SIGNAL DIGEST
 // Запускається кожні 6г, повертає 7-10 карток
