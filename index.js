@@ -41,38 +41,9 @@ function getTrends() {
   return Promise.all(geos.map(fetchGeo)).then(results => {
     trendsCache.items = results.flat();
     trendsCache.fetchedAt = Date.now();
-    saveTrendsToSupabase(trendsCache.items);
     return trendsCache.items;
   });
 }
-
-function saveTrendsToSupabase(items) {
-  // Групуємо по title — збираємо всі гео де trending
-  const byTitle = {};
-  items.forEach(item => {
-    const t = item.title;
-    if (!byTitle[t]) byTitle[t] = { title: t, geos: [], geo_count: 0 };
-    byTitle[t].geos.push(item.geo);
-    byTitle[t].geo_count++;
-  });
-  // Пишемо тільки ті що trending в 2+ країнах — це сигнал
-  Object.values(byTitle)
-    .filter(t => t.geo_count >= 2)
-    .sort((a,b) => b.geo_count - a.geo_count)
-    .slice(0, 30)
-    .forEach(t => {
-      supabaseInsert('trends_signals', {
-        title: t.title,
-        geos: t.geos,
-        geo_count: t.geo_count,
-        score: t.geo_count * 15
-      }, 'title');
-    });
-  console.log('Trends saved to Supabase:', Object.values(byTitle).filter(t=>t.geo_count>=2).length, 'multi-geo items');
-}
-
-// Оновлюємо кожні 15 хв
-setInterval(() => { trendsCache.fetchedAt = 0; getTrends(); }, 900000);
 
 function fetchTrendsSignal(title, editors) {
   const words = title.toLowerCase().split(/\s+/).filter(w=>w.length>3);
@@ -226,66 +197,6 @@ function fetchGdeltSignal(title, lang, wiki, edits, editors) {
         }
       } catch(e) {}
   });
-}
-
-
-// ── COMMENT SIGNAL DETECTION ──
-function parseComment(comment) {
-  if (!comment) return { signal: 0, keywords: [], sentiment: 0 };
-  const c = comment.toLowerCase();
-  const keywords = [];
-  let signal = 0;
-  let sentiment = 0;
-
-  // Смерть / трагедія
-  if (/\bdied\b|\bdeath\b|\bkilled\b|\bmurdered\b|\bdeceased\b/.test(c)) {
-    keywords.push('DEATH'); signal += 30; sentiment = -1;
-  }
-  // Катастрофа
-  if (/\bcrash\b|\bdisaster\b|\bexplosion\b|\battack\b|\bterror\b/.test(c)) {
-    keywords.push('DISASTER'); signal += 25; sentiment = -1;
-  }
-  // Арешт / скандал
-  if (/\barrested\b|\bcharged\b|\bconvicted\b|\bscandal\b|\bindicted\b/.test(c)) {
-    keywords.push('SCANDAL'); signal += 22; sentiment = -1;
-  }
-  // Перемога / призначення
-  if (/\belected\b|\bwon\b|\bappointed\b|\bnamed\b|\bchosen\b/.test(c)) {
-    keywords.push('APPOINTED'); signal += 20; sentiment = 1;
-  }
-  // Банкрутство / колапс
-  if (/\bbankrupt\b|\bcollapsed\b|\bfiled\b|\bliquidat\b/.test(c)) {
-    keywords.push('BANKRUPT'); signal += 22; sentiment = -1;
-  }
-  // Edit war сигнали
-  if (/\breverted\b|\bundone\b|\bvandaliz\b/.test(c)) {
-    keywords.push('REVERT'); signal -= 5; sentiment = 0;
-  }
-  // Захист статті
-  if (/\bprotected\b|\bsemi-protected\b/.test(c)) {
-    keywords.push('PROTECTED'); signal += 10;
-  }
-  // Нова секція (некролог, біографія)
-  if (/\/\* ?(death|personal life|early life|legacy|aftermath) ?\*\//.test(c)) {
-    keywords.push('SECTION:'+c.match(/\/\* ?([^*]+) ?\*\//)?.[1]?.trim().toUpperCase());
-    signal += 15;
-  }
-
-  return { signal, keywords, sentiment };
-}
-
-// ── ARTICLE AGE ──
-const articleFirstSeen = {}; // title → timestamp першого SSE
-
-function getArticleAgeBonus(title, isNewArticle) {
-  const now = Date.now();
-  if (isNewArticle) { articleFirstSeen[title] = now; return 40; }
-  if (!articleFirstSeen[title]) { articleFirstSeen[title] = now; return 0; }
-  const ageMin = (now - articleFirstSeen[title]) / 60000;
-  // Стаття з'явилась в нашому вікні моніторингу дуже нещодавно
-  if (ageMin < 60)  return 20;
-  if (ageMin < 360) return 10;
-  return 0;
 }
 
 // ── SUPABASE ──
@@ -515,6 +426,14 @@ fetchTrending();
 setInterval(fetchTrending, 1800000);
 
 // ── ANOMALY CHECK ──
+// IPO keywords — поріг 1 редактор (підтверджено: CoreWeave T-1, Figma T-8, Circle T-9)
+const IPO_KEYWORDS = ['initial public offering','went public','listed on nasdaq','listed on nyse','ipo filing','direct listing','spac merger','going public','stock market debut','/* ipo */','/* funding */','/* initial public'];
+
+function hasIpoKeyword(comments) {
+  const text = (comments||[]).join(' ').toLowerCase();
+  return IPO_KEYWORDS.some(kw => text.includes(kw));
+}
+
 function looksLikeBot(user, isBot) {
   if (isBot) return true;
   if (!user) return false;
@@ -526,26 +445,19 @@ function looksLikeBot(user, isBot) {
   return false;
 }
 
-async function checkAnomaly(title, wiki, user, isBot, meta={}) {
+async function checkAnomaly(title, wiki, user, isBot, comment) {
   const lang = wiki.replace('wiki', '') || 'en';
   const key = wiki + ':' + title;
   const now = Date.now();
 
   if (!anomWindow[key]) {
-    anomWindow[key] = { ts60:[], users60:new Set(), ts300:[], users300:new Set(), firedMulti:false, firedSingle:false, lastSeen:now, firstSeen:now };
+    anomWindow[key] = { ts60:[], users60:new Set(), ts300:[], users300:new Set(), firedMulti:false, firedSingle:false, lastSeen:now, comments:[] };
   }
   const w = anomWindow[key];
   w.lastSeen = now;
-  const isMinor = meta?.isMinor || false;
   w.ts60.push(now); w.ts300.push(now);
-  // Збираємо коментарі і delta bytes
-  if (!w.comments) w.comments = [];
-  if (!w.deltaBytes) w.deltaBytes = 0;
-  if (typeof comment === 'string' && comment) w.comments.push(comment.toLowerCase().slice(0,100));
-  if (typeof deltaBytes === 'number') w.deltaBytes += deltaBytes;
-  if (w.comments.length > 50) w.comments = w.comments.slice(-50);
-  if (isMinor) w.minorCount = (w.minorCount||0)+1;
-  else w.nonMinorCount = (w.nonMinorCount||0)+1;
+  // Збираємо коментарі
+  if (comment) { w.comments.push(comment.toLowerCase().slice(0,100)); if (w.comments.length > 30) w.comments = w.comments.slice(-30); }
   // Не рахуємо ботів і тимчасові акаунти як унікальних редакторів
   if (user && !looksLikeBot(user, isBot)) { w.users60.add(user); w.users300.add(user); }
   w.ts60  = w.ts60.filter(t => now - t < 60000);
@@ -562,86 +474,56 @@ async function checkAnomaly(title, wiki, user, isBot, meta={}) {
   const spikeThreshold = getSpikeThreshold(wiki);
   const alertKey = key + ':' + Math.floor(now / 300000);
 
-  // ── Supabase: записуємо при 2+ редакторах, оновлюємо при кожному новому ──
-  if (uniq300 >= 2 && hits300 >= 2) {
-    // Пишемо якщо: перший раз АБО новий редактор АБО кожні 2 хв
-    const shouldWrite = !w.firedSupabase
-      || uniq300 > (w.lastUniq300 || 0)
-      || (now - (w.lastSupa || 0)) > 120000;
-    if (shouldWrite) {
-      w.firedSupabase = true;
-      w.lastUniq300 = uniq300;
-      w.lastSupa = now;
-      const wikiUrl = 'https://' + lang + '.wikipedia.org/wiki/' + encodeURIComponent(title.replace(/ /g,'_'));
+  // ── Supabase: записуємо при 2+ редакторах АБО 1 редактор + IPO keyword ──
+  const ipoSignal = uniq300 >= 1 && hits300 >= 1 && hasIpoKeyword(w.comments);
+  if ((uniq300 >= 2 && hits300 >= 2 || ipoSignal) && !w.firedSupabase) {
+    w.firedSupabase = true;
+    const wikiUrl = 'https://' + lang + '.wikipedia.org/wiki/' + encodeURIComponent(title.replace(/ /g,'_'));
 
-      Promise.all([
-        getWikiInfo(title, lang),
-        getViewsRatio(lang, title)
-      ]).then(([info, pvData]) => {
-        const typeWeights = {'СМЕРТЬ':50,'ГЕОПОЛІТИКА':20,'ПОЛІТИК':18,'ВІЙСЬКОВІ':15,
-          'БІЗНЕС':12,'НАУКА':8,'КУЛЬТУРА':6,'СПОРТ':5,'ФУТБОЛ':4,'ПЕРСОНА':3};
-        const atype = info.type || '';
-        const lc = info.langCount || 0;
-        const pvRatio = pvData ? pvData.ratio : 0;
-        const trendItem = (trendingCache && trendingCache.items) ? trendingCache.items.find(t =>
-          t.article.toLowerCase() === title.toLowerCase()) : null;
-        const trendPct = trendItem ? trendItem.delta : null;
+    // Збираємо повні дані асинхронно перед записом
+    Promise.all([
+      getWikiInfo(title, lang),
+      getViewsRatio(lang, title)
+    ]).then(([info, pvData]) => {
+      const typeWeights = {'СМЕРТЬ':50,'ГЕОПОЛІТИКА':20,'ПОЛІТИК':18,'ВІЙСЬКОВІ':15,
+        'БІЗНЕС':12,'НАУКА':8,'КУЛЬТУРА':6,'СПОРТ':5,'ФУТБОЛ':4,'ПЕРСОНА':3};
+      const atype = info.type || '';
+      const lc = info.langCount || 0;
+      const pvRatio = pvData ? pvData.ratio : 0;
+      const trendItem = (trendingCache && trendingCache.items) ? trendingCache.items.find(t =>
+        t.article.toLowerCase() === title.toLowerCase()) : null;
+      const trendPct = trendItem ? trendItem.delta : null;
 
-        const minorPenalty = (w.nonMinorCount||0) > 0 ? 1.0 : 0.4; // якщо всі minor — знижуємо
-        const sectionBonus = (meta?.section||'').toLowerCase().match(/death|killed|died|murder/) ? 30 : 0;
-        const typeScore = (typeWeights[atype.replace(/[^а-яА-ЯіІїЇєЄa-zA-Z]/g,'')] || 0) * minorPenalty;
-        const langScore = Math.min(lc * 0.4, 30);
-        const trendScore = trendPct ? Math.min(trendPct / 20, 20) : 0;
-        const pvScore = pvRatio ? Math.min((pvRatio - 1) * 3, 15) : 0;
-        const e = uniq300;
-        const editorScore = e<=2?e*2.5:e<=4?5+(e-2)*8:e<=9?21+(e-4)*20:121+(e-10)*40;
-        const actScore = editorScore + hits300 * 0.8;
-        const spanMin = (now - (w.firstSeen || now)) / 60000;
-        const susScore = Math.min(spanMin / 10, 15);
-        const resonanceBonus = trendPct && uniq300 >= 2 ? 25 : 0;
-        const burstBonus = e >= 5 && spanMin <= 10 ? 30 : 0;
-        // НОВІ метрики
-        const commentParsed = parseComment(meta.comment||w.lastComment||'');
-        const commentBonus = Math.max(0, commentParsed.signal);
-        const deltaBonus = meta.deltaBytes > 5000 ? 20 : meta.deltaBytes < -2000 ? 15 : 0;
-        const ageBonus = getArticleAgeBonus(title, meta.isNewArticle||false);
-        const score = typeScore + langScore + trendScore + pvScore + actScore + susScore + resonanceBonus + burstBonus + commentBonus + deltaBonus + ageBonus + sectionBonus;
-        // Зберігаємо для наступних правок
-        if (!w.lastComment && meta.comment) w.lastComment = meta.comment;
-        if (commentParsed.keywords.length) w.commentKeywords = commentParsed.keywords;
+      const typeScore = typeWeights[atype.replace(/[^а-яА-ЯіІїЇєЄa-zA-Z]/g,'')] || 0;
+      const langScore = Math.min(lc * 0.4, 30);
+      const trendScore = trendPct ? Math.min(trendPct / 20, 20) : 0;
+      const pvScore = pvRatio ? Math.min((pvRatio - 1) * 3, 15) : 0;
+      const actScore = uniq300 * 2.5 + hits300 * 0.8;
+      const score = typeScore + langScore + trendScore + pvScore + actScore;
 
-        supabaseInsert('anomalies', {
-          title, wiki, lang,
-          type: uniq300 >= 3 ? 'res' : 'mul',
-          edits: hits300,
-          editors: uniq300,
-          lang_count: lc,
-          article_type: atype,
-          url: wikiUrl,
-          score: Math.round(score),
-          is_trending: trendPct !== null,
-          trend_pct: trendPct,
-          comment_keywords: commentParsed.keywords.join(',') || null,
-          delta_bytes: meta.deltaBytes || 0,
-          is_new_article: meta.isNewArticle || false,
-          sentiment: commentParsed.sentiment,
-          section: meta?.section || null,
-          is_minor: isMinor
-        }, 'title,wiki');
-
-        // Prediction markets cross-signal
-        checkPredictionSignals(title, wiki, uniq300, Math.round(score));
-        // PAI розраховується вручну через Spider → /api/pai
-
-      }).catch(() => {
-        supabaseInsert('anomalies', {
-          title, wiki, lang, type: 'mul',
-          edits: hits300, editors: uniq300,
-          lang_count: 0, article_type: '', url: wikiUrl,
-          score: uniq300 * 3 + hits300, is_trending: false, trend_pct: null
-        }, 'title,wiki');
+      supabaseInsert('anomalies', {
+        title: title,
+        wiki: wiki,
+        lang: lang,
+        type: uniq300 >= 3 ? 'res' : 'mul',
+        edits: hits300,
+        editors: uniq300,
+        lang_count: lc,
+        article_type: atype,
+        url: wikiUrl,
+        score: Math.round(score),
+        is_trending: trendPct !== null,
+        trend_pct: trendPct
       });
-    }
+    }).catch(() => {
+      // Fallback — записуємо без деталей
+      supabaseInsert('anomalies', {
+        title, wiki, lang, type: 'mul',
+        edits: hits300, editors: uniq300,
+        lang_count: 0, article_type: '', url: wikiUrl,
+        score: uniq300 * 3 + hits300, is_trending: false, trend_pct: null
+      });
+    });
   }
 
   // ── TELEGRAM: N+ unique editors in 5 min (tier-based) ──
@@ -672,10 +554,10 @@ async function checkAnomaly(title, wiki, user, isBot, meta={}) {
       lang_count: info.langCount,
       article_type: (info.type || '').replace(/[^a-zA-Zа-яА-ЯіІїЇєЄ\s]/g,'').trim(),
       url: 'https://' + lang + '.wikipedia.org/wiki/' + encodeURIComponent(title.replace(/ /g,'_')),
-      score: uniq300 * 3 + hits300,
+      score: (editors300 || editors60) * 3 + (hits300 || hits60),
       is_trending: info.langCount >= 50,
       trend_pct: null
-    }, 'title,wiki');
+    });
 
     // Strict importance filter for Telegram
     const isImportant =
@@ -754,16 +636,13 @@ setInterval(() => {
 // ── HTTP SERVER ──
 const server = http.createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', '*');
-  res.setHeader('Access-Control-Max-Age', '86400');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', '*');
-  if (req.method === 'OPTIONS') { res.writeHead(200, {'Access-Control-Allow-Origin':'*','Access-Control-Allow-Methods':'GET,POST,OPTIONS','Access-Control-Allow-Headers':'*','Access-Control-Max-Age':'86400'}); res.end(); return; }
+  if (req.method === 'OPTIONS') { res.writeHead(200); res.end(); return; }
 
   // /trending endpoint
   if (req.url === '/trending') {
-    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ items: trendingCache.items, fetchedAt: trendingCache.fetchedAt, count: trendingCache.items.length }));
     return;
   }
@@ -1002,72 +881,6 @@ const server = http.createServer((req, res) => {
   }
 
   // ── /fng — Fear & Greed Index ──
-  // ── /markets — VIX, Gold, Oil, DXY, BTC Dominance ──
-  if (req.url === '/markets') {
-    const cached = getCached('markets');
-    if (cached) {
-      res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
-      res.end(cached);
-      return;
-    }
-
-    const symbols = [
-      { key: 'vix',  symbol: '%5EVIX',    name: 'VIX',   unit: '' },
-      { key: 'gold', symbol: 'GC%3DF',    name: 'Gold',  unit: '$' },
-      { key: 'oil',  symbol: 'CL%3DF',    name: 'Oil',   unit: '$' },
-      { key: 'dxy',  symbol: 'DX-Y.NYB',  name: 'DXY',   unit: '' },
-    ];
-
-    const fetchSymbol = (sym) => new Promise((resolve) => {
-      https.get({
-        hostname: 'query1.finance.yahoo.com',
-        path: '/v8/finance/chart/' + sym.symbol + '?interval=1d&range=5d',
-        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ResonanceBot/1.0)' }
-      }, (r) => {
-        let raw = ''; r.on('data', d => raw += d);
-        r.on('end', () => {
-          try {
-            const data = JSON.parse(raw);
-            const result = data.chart?.result?.[0];
-            if (!result) return resolve(null);
-            const closes = result.indicators?.quote?.[0]?.close || [];
-            const current = closes.filter(Boolean).pop();
-            const prev = closes.filter(Boolean).slice(-2)[0];
-            const change = prev ? +((current - prev) / prev * 100).toFixed(2) : 0;
-            resolve({ key: sym.key, name: sym.name, value: +current.toFixed(2), change, unit: sym.unit });
-          } catch(e) { resolve(null); }
-        });
-      }).on('error', () => resolve(null));
-    });
-
-    // BTC Dominance від CoinGecko
-    const fetchBtcDom = () => new Promise((resolve) => {
-      https.get({
-        hostname: 'api.coingecko.com',
-        path: '/api/v3/global',
-        headers: { 'User-Agent': 'ResonanceBot/1.0' }
-      }, (r) => {
-        let raw = ''; r.on('data', d => raw += d);
-        r.on('end', () => {
-          try {
-            const data = JSON.parse(raw);
-            const dom = data.data?.market_cap_percentage?.btc;
-            resolve(dom ? { key: 'btcdom', name: 'BTC Dom', value: +dom.toFixed(1), change: 0, unit: '%' } : null);
-          } catch(e) { resolve(null); }
-        });
-      }).on('error', () => resolve(null));
-    });
-
-    Promise.all([...symbols.map(fetchSymbol), fetchBtcDom()]).then(results => {
-      const items = results.filter(Boolean);
-      const result = JSON.stringify({ items, fetchedAt: Date.now() });
-      setCache('markets', result);
-      res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
-      res.end(result);
-    });
-    return;
-  }
-
   if (req.url === '/fng') {
     https.get('https://api.alternative.me/fng/?limit=7', { headers: { 'User-Agent': 'ResonanceProxy/1.0' } }, (r) => {
       let raw = ''; r.on('data', d => raw += d);
@@ -1092,38 +905,6 @@ const server = http.createServer((req, res) => {
         }
       });
     }).on('error', () => { res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'}); res.end('{}'); });
-    return;
-  }
-
-  // /predictions endpoint
-  if (req.url === '/predictions') {
-    res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
-    res.end(JSON.stringify({
-      items: predCache.items,
-      fetchedAt: predCache.fetchedAt,
-      count: predCache.items.length,
-      bySource: {
-        metaculus: predCache.items.filter(i=>i.source==='metaculus').length,
-        manifold: predCache.items.filter(i=>i.source==='manifold').length,
-        predictit: predCache.items.filter(i=>i.source==='predictit').length,
-      }
-    }));
-    return;
-  }
-
-  // /sec endpoint — SEC EDGAR filings
-  if (req.url.startsWith('/sec')) {
-    const params = new URLSearchParams(req.url.split('?')[1]||'');
-    const forms = params.get('forms') || 'S-1,S-1/A,8-K,SC 13D,425,DEFM14A';
-    // Скидаємо кеш якщо запит з браузера (force refresh)
-    if (params.get('refresh') === '1') secCache.fetchedAt = 0;
-    fetchSecFilings(forms).then(items => {
-      res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
-      res.end(JSON.stringify({ items, fetchedAt: secCache.fetchedAt, count: items.length }));
-    }).catch(() => {
-      res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
-      res.end(JSON.stringify({ items: [], count: 0 }));
-    });
     return;
   }
 
@@ -1283,20 +1064,14 @@ function connectGlobalUpstream() {
             if ((data.type === 'edit' || data.type === 'new') &&
                 ALL_WIKIS.has(data.wiki) &&
                 data.title && !data.title.includes(':')) {
-              const deltaBytes = (data.length?.new||0) - (data.length?.old||0);
               const comment = data.comment || data.parsedcomment || '';
-              const isNewArticle = data.type === 'new' || (data.revision?.old === 0);
-              const isMinor = !!data.minor;
-              const section = comment.match(/\/\* ?([^*]+?) ?\*\//)?.[1] || '';
-              const meta = { deltaBytes, comment, isNewArticle, isMinor, section };
-              checkAnomaly(data.title, data.wiki, data.user, data.bot, meta);
+              checkAnomaly(data.title, data.wiki, data.user, data.bot, comment);
               const msg = 'data: ' + JSON.stringify({
                 title: data.title, wiki: data.wiki,
                 user: data.user, bot: data.bot,
                 type: data.type, timestamp: data.timestamp,
                 tier: getTier(data.wiki),
-                deltaBytes, comment: comment.slice(0,100),
-                isNewArticle
+                comment: comment.slice(0, 100)
               }) + '\n\n';
               // Broadcast to all connected clients
               sseClients.forEach(client => {
@@ -1323,601 +1098,6 @@ function connectGlobalUpstream() {
 }
 
 // Start global Wikipedia upstream immediately on launch
-
-// ════════════════════════════════════════
-// PREDICTION MARKETS — Рівень 1
-// Metaculus + Manifold + PredictIt
-// ════════════════════════════════════════
-
-let predCache = { items: [], fetchedAt: 0 };
-
-// ── POLYMARKET (замість Metaculus який закрив API) ──
-async function fetchPolymarketDirect() {
-  return new Promise((resolve) => {
-    https.get({
-      hostname: 'gamma-api.polymarket.com',
-      path: '/markets?closed=false&limit=100&order=volumeNum&ascending=false',
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
-        'Accept': 'application/json',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Origin': 'https://polymarket.com',
-        'Referer': 'https://polymarket.com/'
-      }
-    }, (res) => {
-      let raw = ''; res.on('data', d => raw += d);
-      res.on('end', () => {
-        // CF повертає HTML якщо блокує
-        if (raw.startsWith('<!DOCTYPE') || raw.startsWith('<html')) {
-          console.log('Polymarket CF blocked, using cache');
-          resolve(polyCache.items.slice(0,50).map(m => ({
-            source: 'polymarket',
-            id: 'pm_' + (m.id||''),
-            title: m.question || '',
-            probability: (() => { try { return parseFloat(JSON.parse(m.outcomePrices||'[]')[0]||0); } catch(e) { return null; } })(),
-            volume: Math.round((m.volumeNum||0)/1000),
-            url: 'https://polymarket.com/event/' + (m.slug||''),
-            categories: '',
-            activity: m.volumeNum || 0,
-            closeTime: m.endDateIso || null
-          })).filter(q => q.title));
-          return;
-        }
-        try {
-          const data = JSON.parse(raw);
-          const items = (Array.isArray(data) ? data : []).map(m => {
-            let prob = null;
-            try { prob = parseFloat(JSON.parse(m.outcomePrices||'[]')[0]||0); } catch(e) {}
-            return {
-              source: 'polymarket',
-              id: 'pm_' + (m.id||''),
-              title: m.question || '',
-              probability: prob,
-              volume: Math.round((m.volumeNum||0)/1000),
-              url: 'https://polymarket.com/event/' + (m.slug||''),
-              categories: '',
-              activity: m.volumeNum || 0,
-              closeTime: m.endDateIso || null
-            };
-          }).filter(q => q.title);
-          if (items.length) polyCache = { items: data, fetchedAt: Date.now() };
-          console.log('Polymarket direct:', items.length, 'markets');
-          resolve(items);
-        } catch(e) { console.log('Polymarket parse error:', e.message); resolve([]); }
-      });
-    }).on('error', e => { console.log('Polymarket direct error:', e.message); resolve([]); });
-  });
-}
-
-// ── MANIFOLD ──
-async function fetchManifold() {
-  return new Promise((resolve) => {
-    const makeReq = (options) => {
-      const req = https.get(options, (res) => {
-        if (res.statusCode === 301 || res.statusCode === 302) {
-          const loc = res.headers.location || '';
-          res.resume();
-          if (loc.startsWith('http')) {
-            const u = new URL(loc);
-            makeReq({ hostname: u.hostname, path: u.pathname + u.search, headers: options.headers });
-          }
-          return;
-        }
-        let raw = ''; res.on('data', d => raw += d);
-        res.on('end', () => {
-          try {
-            const data = JSON.parse(raw);
-            if (!Array.isArray(data)) { console.log('Manifold not array:', typeof data); resolve([]); return; }
-            const items = data.map(q => ({
-              source: 'manifold',
-              id: 'mf_' + q.id,
-              title: q.question || '',
-              probability: q.probability || null,
-              volume: Math.round(q.volume || 0),
-              url: q.url || 'https://manifold.markets/' + q.id,
-              categories: (q.tags || []).join(','),
-              activity: q.volume || 0,
-              closeTime: q.closeTime ? new Date(q.closeTime).toISOString() : null
-            })).filter(q => q.title);
-            console.log('Manifold:', items.length, 'markets');
-            resolve(items);
-          } catch(e) { console.log('Manifold parse error:', e.message, raw.slice(0,100)); resolve([]); }
-        });
-      });
-      req.on('error', e => { console.log('Manifold error:', e.message); resolve([]); });
-      req.setTimeout(8000, () => { req.destroy(); resolve([]); });
-    };
-    makeReq({
-      hostname: 'api.manifold.markets',
-      path: '/v0/markets?limit=50&sort=last-bet-time',
-      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ResonanceBot/1.0)', 'Accept': 'application/json' }
-    });
-  });
-}
-
-// ── PREDICTIT ──
-async function fetchPredictIt() {
-  return new Promise((resolve) => {
-    https.get({
-      hostname: 'www.predictit.org',
-      path: '/api/marketdata/all/',
-      headers: { 'User-Agent': 'ResonanceBot/1.0', 'Accept': 'application/json' }
-    }, (res) => {
-      let raw = ''; res.on('data', d => raw += d);
-      res.on('end', () => {
-        try {
-          const data = JSON.parse(raw);
-          const items = (data.markets || []).map(m => {
-            // Беремо контракт з найвищим обсягом
-            const contracts = m.contracts || [];
-            const top = contracts.sort((a,b) => (b.volume||0)-(a.volume||0))[0];
-            const prob = top ? (top.lastTradePrice || top.bestYesPrice || null) : null;
-            return {
-              source: 'predictit',
-              id: 'pi_' + m.id,
-              title: m.name || '',
-              probability: prob,
-              volume: contracts.reduce((s,c) => s+(c.volume||0), 0),
-              url: m.url || 'https://www.predictit.org/markets/detail/' + m.id,
-              categories: '',
-              activity: m.dateEndKnown ? 1 : 0,
-              closeTime: m.timeStamp || null
-            };
-          }).filter(q => q.title);
-          console.log('PredictIt:', items.length, 'markets');
-          resolve(items);
-        } catch(e) { console.log('PredictIt error:', e.message); resolve([]); }
-      });
-    }).on('error', e => { console.log('PredictIt fetch error:', e.message); resolve([]); });
-  });
-}
-
-// ── АГРЕГАТОР ──
-async function fetchAllPredictions() {
-  const now = Date.now();
-  if (now - predCache.fetchedAt < 600000 && predCache.items.length) {
-    return predCache.items;
-  }
-
-  const [metaculus, manifold, predictit] = await Promise.all([
-    fetchPolymarketDirect(),
-    fetchManifold(),
-    fetchPredictIt()
-  ]);
-
-  const all = [...metaculus, ...manifold, ...predictit];
-  predCache = { items: all, fetchedAt: now };
-  console.log('Predictions total:', all.length);
-  return all;
-}
-
-// ── KEYWORD MATCH ──
-function matchPrediction(wikiTitle, predictions) {
-  const words = wikiTitle.toLowerCase()
-    .split(/[\s,.-]+/)
-    .filter(w => w.length > 3);
-
-  return predictions
-    .filter(p => {
-      const t = p.title.toLowerCase();
-      const matchCount = words.filter(w => t.includes(w)).length;
-      // Мінімум 2 слова або 1 довге (> 6 символів)
-      return matchCount >= 2 || words.some(w => w.length > 6 && t.includes(w));
-    })
-    .map(p => {
-      const t = p.title.toLowerCase();
-      const matchCount = words.filter(w => t.includes(w)).length;
-      const correlation = Math.min(matchCount / words.length, 1);
-      return { ...p, correlation };
-    })
-    .sort((a,b) => b.correlation - a.correlation)
-    .slice(0, 3);
-}
-
-// ── CROSS SIGNAL GENERATOR ──
-async function checkPredictionSignals(title, wiki, editors, score) {
-  if (editors < 2) return; // тільки для підтверджених аномалій
-
-  try {
-    const predictions = await fetchAllPredictions();
-    const matches = matchPrediction(title, predictions);
-
-    for (const match of matches) {
-      const prob = match.probability !== null ? Math.round(match.probability * 100) : null;
-      const detail = [
-        prob !== null ? 'YES:' + prob + '%' : '',
-        match.volume > 0 ? 'vol:' + (match.volume > 1000 ? Math.round(match.volume/1000)+'K' : match.volume) : '',
-        match.source.toUpperCase(),
-        'corr:' + Math.round(match.correlation*100) + '%'
-      ].filter(Boolean).join(' · ');
-
-      const crossScore = Math.round(score * match.correlation * (prob ? prob/100 : 0.5));
-
-      console.log('Prediction match:', title, '->', match.title.slice(0,60), '| prob:', prob, '| score:', crossScore);
-
-      supabaseInsert('cross_signals', {
-        type: 'WIKI+PREDICT',
-        title: title,
-        detail: detail + ' · ' + match.title.slice(0, 80),
-        wiki_title: title,
-        crypto_symbol: null,
-        score: crossScore,
-        source_url: match.url
-      });
-
-      // Telegram якщо сильний сигнал
-      if (crossScore > 100 && editors >= 3 && TELEGRAM_TOKEN) {
-        const emoji = prob > 70 ? '🟢' : prob > 40 ? '🟡' : '🔴';
-        sendTelegram(
-          emoji + ' <b>Prediction Signal: ' + title + '</b>\n\n' +
-          '📊 ' + match.source.toUpperCase() + ': ' + match.title.slice(0,80) + '\n' +
-          (prob !== null ? '💰 Ймовірність: <b>' + prob + '%</b>\n' : '') +
-          '📈 Обсяг: ' + match.volume + ' · Cross score: ' + crossScore + '\n' +
-          '🔗 <a href="' + match.url + '">відкрити ринок</a>'
-        );
-      }
-    }
-  } catch(e) {
-    console.log('Prediction signal error:', e.message);
-  }
-}
-
-// Оновлюємо prediction cache кожні 10 хв
-fetchAllPredictions();
-setInterval(fetchAllPredictions, 600000);
-
-
-// ════════════════════════════════════════
-// KEYWORD DETECTION + NEW SCORING
-// ════════════════════════════════════════
-
-const KEYWORD_GROUPS = {
-  CRISIS:      { words: ['bankruptcy','chapter 11','bankrupt','insolvent','collapsed','fraud','arrested','indicted','charged','convicted','coup','overthrow','martial law','state of emergency','shooting','explosion','disaster','crash','killed'], score: 60 },
-  MILESTONE:   { words: ['trillion','billion dollar','record high','all-time high','most valuable','milestone','historic','unprecedented','largest ever','first ever','ipo','went public','listed on nasdaq','listed on nyse'], score: 50 },
-  CORPORATE:   { words: ['acquisition','acquired','merger','takeover','spinoff','spin-off','joint venture','stake','buyout','privatization','delisted','stepped down','resigned','appointed','fired','ousted','ceo change'], score: 40 },
-  GEOPOLITICAL:{ words: ['invaded','invasion','sanctions','ceasefire','annexed','annexation','declared war','military operation','airstrike','coup','referendum','independence'], score: 35 },
-  CRYPTO:      { words: ['exploit','hack','rug pull','token launch','listing','delisted','sec charges','ponzi','exit scam','flash loan'], score: 25 },
-  REWRITE:     { words: ['rewrite','major revision','complete overhaul','restructure','rewrote'], score: 30 },
-  CURRENT:     { words: ['{{current}}','currentevent','this article documents','breaking'], score: 45 },
-  PROTECTION:  { words: ['protected','semi-protected','full protection','edit war','editwar'], score: 20 },
-};
-
-function detectKeywords(comments) {
-  const text = comments.join(' ').toLowerCase();
-  const found = [];
-  let bonusScore = 0;
-  
-  for (const [group, cfg] of Object.entries(KEYWORD_GROUPS)) {
-    if (cfg.words.some(w => text.includes(w))) {
-      found.push(group);
-      bonusScore += cfg.score;
-    }
-  }
-  return { keywords: found, bonusScore };
-}
-
-function calcNewScore({ editors, langCount, trendPct, deltaBytes, keywords, bonusScore, isNew, pvRatio, predictionMatch }) {
-  // ШАР 1: якість сигналу (редактори)
-  const editorMult = editors >= 10 ? 3.0 : editors >= 5 ? 2.0 : editors >= 3 ? 1.5 : editors >= 2 ? 1.0 : 0.5;
-  
-  // ШАР 2: зміст коментарів
-  const contentScore = bonusScore || 0;
-  
-  // ШАР 3: контекст (мови)
-  const langMult = langCount >= 50 ? 2.5 : langCount >= 20 ? 1.8 : langCount >= 10 ? 1.3 : langCount >= 5 ? 1.2 : langCount >= 2 ? 0.8 : 0.4;
-  
-  // Базовий score
-  let score = (editors * 3 + contentScore) * editorMult * langMult;
-  
-  // Підсилювачі
-  if (trendPct >= 100) score *= 1.5;
-  else if (trendPct >= 50) score *= 1.3;
-  
-  if (pvRatio >= 5) score *= 1.3;
-  else if (pvRatio >= 2) score *= 1.1;
-  
-  if (predictionMatch) score *= 1.3;
-  
-  if (deltaBytes > 5000) score *= 1.2;
-  else if (deltaBytes < -2000) score *= 0.8;
-  
-  if (isNew) score *= 1.8;
-  
-  return Math.round(score);
-}
-
-// Додати в index.js Railway — SEC EDGAR моніторинг
-
-// ════════════════════════════════════════
-// SEC EDGAR — S-1 / 8-K / 13D моніторинг
-// ════════════════════════════════════════
-
-let secCache = { items: [], fetchedAt: 0 };
-
-const EIGHT_K_ITEMS = {
-  '1.01': { label: 'M&A угода',      score: 80, emoji: '💼' },
-  '1.02': { label: 'M&A завершення', score: 70, emoji: '💼' },
-  '1.03': { label: 'Банкрутство',    score: 90, emoji: '💥' },
-  '2.02': { label: 'Результати',     score: 50, emoji: '📊' },
-  '2.04': { label: 'Дефолт',         score: 85, emoji: '🔴' },
-  '5.01': { label: 'Зміна власника', score: 75, emoji: '🎯' },
-  '5.02': { label: 'Зміна CEO/CFO',  score: 70, emoji: '👤' },
-  '7.01': { label: 'Прес-реліз',     score: 30, emoji: '📢' },
-  '8.01': { label: 'Інше',           score: 20, emoji: '📄' },
-};
-
-const SEC_FORMS = {
-  'S-1':   { label: 'IPO',        emoji: '🚀', score: 80 },
-  'S-1/A': { label: 'IPO амend',  emoji: '🚀', score: 40 },
-  '8-K':   { label: 'Подія',      emoji: '⚡', score: 60 },
-  'SC 13D':{ label: 'Акціонер',   emoji: '🎯', score: 50 },
-  'SC 13G':{ label: 'Акціонер',   emoji: '🎯', score: 30 },
-  '425':   { label: 'M&A',        emoji: '💼', score: 70 },
-  'DEFM14A':{ label: 'Merger',    emoji: '💼', score: 75 },
-};
-
-async function fetchSecFilings(forms) {
-  const now = Date.now();
-  const cacheKey = forms || 'default';
-  if (now - secCache.fetchedAt < 300000 && secCache.items.length && secCache.key === cacheKey) return secCache.items;
-
-  const today = new Date().toISOString().slice(0, 10);
-  const yesterday = new Date(now - 86400000).toISOString().slice(0, 10);
-  const formList = forms || Object.keys(SEC_FORMS).join(',');
-
-  return new Promise((resolve) => {
-    const path = '/LATEST/search-index?forms=' +
-      encodeURIComponent(formList) +
-      '&dateRange=custom&startdt=' + yesterday +
-      '&enddt=' + today +
-      '&_source=file_date,display_names,period_ending,file_num,root_forms,biz_states,items&from=0&size=100';
-
-    https.get({
-      hostname: 'efts.sec.gov',
-      path,
-      headers: { 'User-Agent': 'ResonanceBot/1.0 contact@resonance.app', 'Accept': 'application/json' }
-    }, (res) => {
-      let raw = ''; res.on('data', d => raw += d);
-      res.on('end', () => {
-        try {
-          const data = JSON.parse(raw);
-          const seen = new Set();
-          const items = [];
-
-          for (const hit of (data.hits?.hits || [])) {
-            const s = hit._source;
-            const nameRaw = s.display_names?.[0] || '';
-            const company = nameRaw.split('(')[0].trim();
-            const tickerM = nameRaw.match(/\(([A-Z0-9]{1,5})\)/);
-            const ticker = tickerM ? tickerM[1] : '';
-            const form = s.root_forms?.[0] || '';
-            const key = company + ':' + form;
-
-            if (seen.has(key)) continue;
-            seen.add(key);
-
-            let meta = SEC_FORMS[form] || { label: form, emoji: '📄', score: 20 };
-            let itemTypes = s.items || [];
-
-            // Для 8-K — беремо найважливіший item
-            if (form === '8-K' && itemTypes.length) {
-              const best = itemTypes
-                .map(it => EIGHT_K_ITEMS[it] || { label: it, score: 0, emoji: '📄' })
-                .sort((a, b) => b.score - a.score)[0];
-              if (best.score > meta.score || best.score > 20) {
-                meta = { ...meta, label: best.label, emoji: best.emoji, score: Math.max(meta.score, best.score) };
-              }
-              // Фільтруємо нудні 8-K
-              const maxScore = itemTypes.length ? Math.max(...itemTypes.map(it => (EIGHT_K_ITEMS[it]||{score:0}).score)) : 0;
-              if (maxScore < 40) { seen.delete(key); continue; }
-            }
-
-            items.push({
-              company: company.slice(0, 60),
-              ticker,
-              form,
-              label: meta.label,
-              emoji: meta.emoji,
-              score: meta.score,
-              state: s.biz_states?.[0] || '',
-              date: s.file_date,
-              url: 'https://www.sec.gov/cgi-bin/browse-edgar?company=' +
-                   encodeURIComponent(company.replace(/[,.]/g,'').trim()) +
-                   '&CIK=&type=' + encodeURIComponent(form) +
-                   '&dateb=&owner=include&count=10&search_text=&action=getcompany',
-              itemTypes
-            });
-          }
-
-          // Сортуємо за score (важливість форми)
-          items.sort((a, b) => b.score - a.score);
-          secCache = { items, fetchedAt: now, key: cacheKey };
-          console.log('SEC updated:', items.length, 'filings, forms:', [...new Set(items.map(i => i.form))].join(','));
-          resolve(items);
-        } catch(e) {
-          console.log('SEC parse error:', e.message);
-          resolve([]);
-        }
-      });
-    }).on('error', e => { console.log('SEC fetch error:', e.message); resolve([]); });
-  });
-}
-
-// Cross-signal: SEC filing + Wikipedia burst
-async function checkSecWikiSignal(secItem) {
-  if (!secItem.company) return;
-  // Беремо тільки значимі слова - мінімум 5 символів, не стоп-слова
-  const stopWords = new Set(['inc','corp','ltd','llc','the','and','for','with','from','that','this','have','will','been','were','they','their','your','what','when','where','which','who','how','its','our','more','also','than','into','over','after','some','such','only','each','most','then','other','these','those','would','could','should','about','there','between','through','because','within','without','during','before','after','since','while','group','holdings','company','partners','capital','management','services','solutions','systems','technologies','therapeutics','biosciences','health']);
-  
-  const words = secItem.company.toLowerCase()
-    .replace(/[.,()]/g, ' ')
-    .split(/\s+/)
-    .filter(w => w.length >= 5 && !stopWords.has(w));
-  
-  if (words.length === 0) return; // нема значимих слів
-  
-  // Шукаємо в anomWindow
-  for (const [key, w] of Object.entries(anomWindow)) {
-    const wikiTitle = key.split(':').slice(1).join(':').toLowerCase();
-    // Мінімум 1 значиме слово має точно матчитись (не підрядок)
-    const wikiWords = wikiTitle.split(/\s+/);
-    const matchCount = words.filter(word => wikiWords.includes(word)).length;
-    if (matchCount === 0) continue; // тільки точний збіг слів
-    if (w.ts300.length < 2) continue;
-
-    console.log('SEC+WIKI signal:', secItem.company, '->', wikiTitle, '| form:', secItem.form);
-    supabaseInsert('cross_signals', {
-      type: 'SEC+WIKI',
-      title: secItem.company,
-      detail: secItem.emoji + ' ' + secItem.form + ' · ' + secItem.label + ' · wiki: ' + wikiTitle,
-      wiki_title: wikiTitle,
-      crypto_symbol: null,
-      score: secItem.score * 2,
-      source_url: secItem.url
-    });
-
-    if (TELEGRAM_TOKEN) {
-      sendTelegram(
-        '📋 <b>SEC+WIKI Signal: ' + secItem.company + '</b>\n\n' +
-        secItem.emoji + ' Form <b>' + secItem.form + '</b> (' + secItem.label + ')\n' +
-        '📖 Wikipedia активна: ' + wikiTitle + '\n' +
-        '🔗 <a href="' + secItem.url + '">SEC filing</a>'
-      );
-    }
-  }
-}
-
-// Оновлюємо SEC кожні 15 хв і перевіряємо cross-signals
-async function pollSec() {
-  try {
-    const items = await fetchSecFilings('S-1,S-1/A,8-K,SC 13D,425,DEFM14A');
-    // Перевіряємо cross-signals з активними Wikipedia аномаліями
-    for (const item of items.filter(i => i.score >= 60)) {
-      await checkSecWikiSignal(item);
-    }
-  } catch(e) {
-    console.log('SEC poll error:', e.message);
-  }
-}
-
-pollSec();
-setInterval(pollSec, 900000); // кожні 15 хв
-
-
-// ════════════════════════════════════════
-// GROQ LLM — семантична класифікація
-// Wikipedia коментарів
-// ════════════════════════════════════════
-
-const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
-const GROQ_MODEL = 'llama-3.3-70b-versatile';
-
-// Кеш щоб не класифікувати однакові коментарі двічі
-const groqCache = new Map();
-
-async function classifyWithGroq(comments, title, wiki) {
-  if (!GROQ_API_KEY) return null;
-  if (!comments?.length) return null;
-
-  // Беремо тільки унікальні непорожні коментарі
-  const unique = [...new Set(comments.filter(c => c && c.length > 5))].slice(0, 5);
-  if (!unique.length) return null;
-
-  const cacheKey = unique.join('|');
-  if (groqCache.has(cacheKey)) return groqCache.get(cacheKey);
-
-  const prompt = `You are a financial signal detector analyzing Wikipedia edit comments.
-
-Article: "${title}" (${wiki})
-Recent edit comments:
-${unique.map((c, i) => `${i+1}. "${c}"`).join('\n')}
-
-Respond ONLY with valid JSON, no markdown, no explanation:
-{
-  "event_type": "IPO|CRISIS|MILESTONE|DEATH|CORPORATE|GEOPOLITICAL|CRYPTO|NOISE",
-  "signal_strength": 0.0,
-  "affected_assets": [],
-  "direction": "LONG|SHORT|STRADDLE|WATCH|NONE",
-  "pimino_score": 0.0,
-  "keywords": [],
-  "reasoning": "one sentence max"
-}
-
-Rules:
-- signal_strength: 0.0-1.0 (how financially significant)
-- pimino_score: 0.0-1.0 (viral amplification potential)
-- affected_assets: stock tickers, sectors, or currencies
-- direction: market direction implied by the event
-- NOISE if edits are routine/maintenance`;
-
-  return new Promise((resolve) => {
-    const body = JSON.stringify({
-      model: GROQ_MODEL,
-      max_tokens: 250,
-      temperature: 0.1,
-      messages: [{ role: 'user', content: prompt }]
-    });
-
-    const req = https.request({
-      hostname: 'api.groq.com',
-      path: '/openai/v1/chat/completions',
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': 'Bearer ' + GROQ_API_KEY,
-        'Content-Length': Buffer.byteLength(body)
-      }
-    }, (res) => {
-      let data = '';
-      res.on('data', c => data += c);
-      res.on('end', () => {
-        try {
-          const json = JSON.parse(data);
-          if (json.error) {
-            console.log('Groq API error:', json.error.message?.slice(0,80));
-            resolve(null); return;
-          }
-          const text = json.choices?.[0]?.message?.content || '{}';
-          const clean = text.replace(/```json|```/g, '').trim();
-          const result = JSON.parse(clean);
-
-          // Кешуємо на 30 хвилин
-          groqCache.set(cacheKey, result);
-          setTimeout(() => groqCache.delete(cacheKey), 1800000);
-
-          console.log('Groq classified:', title,
-            '| type:', result.event_type,
-            '| strength:', result.signal_strength,
-            '| pimino:', result.pimino_score,
-            '| assets:', result.affected_assets?.join(',') || 'none'
-          );
-          resolve(result);
-        } catch(e) {
-          console.log('Groq parse error:', e.message, data.slice(0,100));
-          resolve(null);
-        }
-      });
-    });
-    req.on('error', e => { console.log('Groq req error:', e.message); resolve(null); });
-    req.setTimeout(8000, () => { req.destroy(); resolve(null); });
-    req.write(body);
-    req.end();
-  });
-}
-
-// Groq usage stats
-let groqStats = { calls: 0, hits: 0, errors: 0, resetAt: Date.now() };
-setInterval(() => {
-  if (groqStats.calls > 0) {
-    console.log('Groq stats (last hour):',
-      'calls:', groqStats.calls,
-      '| cache hits:', groqStats.hits,
-      '| errors:', groqStats.errors
-    );
-  }
-  groqStats = { calls: 0, hits: 0, errors: 0, resetAt: Date.now() };
-}, 3600000);
-
 connectGlobalUpstream();
 
 server.listen(process.env.PORT || 3000, '0.0.0.0', () => {
@@ -1926,7 +1106,7 @@ server.listen(process.env.PORT || 3000, '0.0.0.0', () => {
   console.log('TG thresholds — Tier1: 4+ editors | Tier2: 5+ editors | Tier3: 6+ editors');
   if (TELEGRAM_TOKEN) {
     sendTelegram(
-      '🟢 <b>Resonance v6 запущено</b>\n\n' +
+      '🟢 <b>Resonance v5 запущено</b>\n\n' +
       '📡 Wikipedia + GitHub + Binance\n' +
       '📡 Мов: ' + ALL_WIKIS.size + ' (en/de/fr/es/ru/ja/zh + ar/fa/ta/hi + 19 інших)\n\n' +
       '⚙️ Пороги Telegram:\n' +
@@ -2199,168 +1379,3 @@ function findCrossSignals() {
 
   return signals;
 }
-
-// ════════════════════════════════════════
-// PAGEVIEW POLLER — кожні 10 хв через Vercel edge
-// Пише pageview_spikes в Supabase → всі браузери бачать однаково
-// ════════════════════════════════════════
-
-const VERCEL_PV = 'https://resonance-dashboard-7a1u.vercel.app/api/pageviews';
-
-// ════════════════════════════════════════
-// PAI — Піміно Amplification Index
-// Оцінює потенціал поширення події через Claude
-// ════════════════════════════════════════
-
-const paiCache = {}; // title → {pai, details, ts}
-
-async function calcPAI(title, articleType, langCount, editors) {
-  const cacheKey = title;
-  const now = Date.now();
-
-  // Кешуємо на 24 год
-  if (paiCache[cacheKey] && now - paiCache[cacheKey].ts < 86400000) {
-    return paiCache[cacheKey];
-  }
-
-  // Тільки для важливих подій щоб не витрачати API
-  const importantTypes = ['СМЕРТЬ','ПОЛІТИК','ГЕОПОЛІТИКА','ВІЙСЬКОВІ','БІЗНЕС'];
-  if (!importantTypes.includes(articleType) && langCount < 20) return null;
-
-  const prompt = `Analyze this Wikipedia event for viral/resonance potential.
-Event: "${title}"
-Type: ${articleType || 'unknown'}
-Language versions: ${langCount}
-Simultaneous editors: ${editors}
-
-Rate these 4 factors from 0.0 to 1.0:
-1. identification: Can people identify with the victim/subject? (0=no, 1=universal)
-2. concrete_villain: Is there a specific named perpetrator/cause? (0=anonymous system, 1=named person)
-3. amplifier: Is there an existing movement/media ready to amplify? (0=none, 1=large ready audience)
-4. evidence: Is there visual/video evidence or clear documentation? (0=none, 1=viral video)
-
-Also provide:
-- amplification_type: "person" | "movement" | "symbol" | "system" | "none"
-- resonance_prediction: "viral" | "regional" | "local" | "none"
-- brief_reason: one sentence why
-
-Respond ONLY with valid JSON, no markdown:
-{"identification":0.0,"concrete_villain":0.0,"amplifier":0.0,"evidence":0.0,"amplification_type":"none","resonance_prediction":"none","brief_reason":"..."}`;
-
-  return new Promise((resolve) => {
-    const body = JSON.stringify({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 300,
-      messages: [{ role: 'user', content: prompt }]
-    });
-
-    const req = https.request({
-      hostname: 'api.anthropic.com',
-      path: '/v1/messages',
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(body),
-        'anthropic-version': '2023-06-01',
-        'x-api-key': process.env.ANTHROPIC_API_KEY || ''
-      }
-    }, (res) => {
-      let data = '';
-      res.on('data', c => data += c);
-      res.on('end', () => {
-        try {
-          const json = JSON.parse(data);
-          const text = (json.content || []).filter(b => b.type === 'text').map(b => b.text).join('').trim();
-          const details = JSON.parse(text);
-          const pai = details.identification * details.concrete_villain * details.amplifier * details.evidence;
-          const result = { pai: Math.round(pai * 100) / 100, details, ts: Date.now() };
-          paiCache[cacheKey] = result;
-          console.log('PAI:', title, '→', result.pai, details.resonance_prediction);
-          resolve(result);
-        } catch(e) {
-          console.log('PAI parse error:', e.message);
-          resolve(null);
-        }
-      });
-    });
-    req.on('error', () => resolve(null));
-    req.setTimeout(15000, () => { req.destroy(); resolve(null); });
-    req.write(body);
-    req.end();
-  });
-}
-
-async function pollPageviews() {
-  if (!trendingCache.items.length) return;
-
-  // Беремо топ-30 trending + активні edit аномалії
-  const trendTitles = trendingCache.items.slice(0, 20).map(t => t.article);
-  const anomTitles  = Object.keys(anomWindow)
-    .map(k => k.split(':').slice(1).join(':'))
-    .filter(Boolean)
-    .slice(0, 10);
-
-  // Унікальні, без дублів
-  const allTitles = [...new Set([...trendTitles, ...anomTitles])];
-  if (!allTitles.length) return;
-
-  const encoded = allTitles.map(t => encodeURIComponent(t.replace(/ /g,'_'))).join(',');
-  const url = VERCEL_PV + '?titles=' + encoded + '&lang=en&mode=hourly';
-
-  try {
-    const r = await fetch(url);
-    if (!r.ok) { console.log('PV poll error:', r.status); return; }
-    const data = await r.json();
-    if (!data.batch) return;
-
-    const now = Date.now();
-    let inserted = 0;
-
-    for (const [rawTitle, pv] of Object.entries(data.batch)) {
-      if (!pv || !pv.items || pv.items.length < 3) continue;
-      const { ratio, trend, items } = pv;
-      if (ratio < 2) continue; // тільки справжні спайки
-
-      const title = rawTitle.replace(/_/g, ' ');
-      const lastViews = items[items.length - 1]?.v || 0;
-
-      // Серіалізуємо останні 24 год (погодинно) для спарклайну
-      const sparkline = items.slice(-24).map(i => i.v);
-
-      supabaseInsert('pageview_spikes', {
-        title,
-        lang: 'en',
-        ratio: Math.round(ratio * 10) / 10,
-        trend_pct: trend || 0,
-        last_views: lastViews,
-        sparkline: JSON.stringify(sparkline),
-        url: 'https://en.wikipedia.org/wiki/' + encodeURIComponent(title.replace(/ /g,'_')),
-        is_trending: trendingCache.items.some(t => t.article === title)
-      }, 'title,lang');
-      inserted++;
-
-      // Якщо дуже різкий спайк — cross_signal (upsert по title+type)
-      if (ratio >= 5) {
-        supabaseInsert('cross_signals', {
-          type: 'WIKI+PAGEVIEW',
-          title,
-          detail: '×' + ratio.toFixed(1) + ' від норми · ' + lastViews.toLocaleString() + ' переглядів',
-          wiki_title: title,
-          crypto_symbol: null,
-          score: Math.round(ratio * 8)  // ratio 11 → 88, ratio 20 → 160
-        }, 'title,type');
-      }
-    }
-
-    if (inserted > 0) console.log('PV poll: inserted', inserted, 'spikes');
-  } catch(e) {
-    console.log('PV poll fetch error:', e.message);
-  }
-}
-
-// Додаємо /pv endpoint щоб дашборд читав поточні спайки
-// (замість локального pvPinned — тепер з Supabase)
-
-// Старт + інтервал кожні 10 хв
-setTimeout(pollPageviews, 30000); // перший запуск через 30 сек після старту
-setInterval(pollPageviews, 600000);
