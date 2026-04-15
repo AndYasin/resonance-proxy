@@ -2013,6 +2013,12 @@ function mapAssets(title, articleType, categories, groqAssets) {
   if (titleLow.includes('ukraine') || titleLow.includes('zelensky') || titleLow.includes('ukrainian')) {
     assets.add('UAH'); assets.add('GLD');
   }
+  // US Politicians → SPY
+  const usStates = ['california','texas','florida','new york','georgia','arizona','michigan','pennsylvania'];
+  const isUSPolitician = usStates.some(s => text.includes(s)) || 
+    text.includes('congress') || text.includes('senate') || 
+    text.includes('representative') || text.includes('governor');
+  if (isUSPolitician) { assets.add('SPY'); assets.add('USD'); }
 
   return [...assets].slice(0, 5); // максимум 5 активів
 }
