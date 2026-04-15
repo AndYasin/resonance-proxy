@@ -968,6 +968,18 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+
+  // /assets?title=X — asset mapping для статті
+  if (req.url.startsWith('/assets?')) {
+    const q = new URLSearchParams(req.url.split('?')[1]||'');
+    const title = q.get('title') || '';
+    const type = q.get('type') || '';
+    const assets = mapAssets(title, type, '', null);
+    res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+    res.end(JSON.stringify({ title, type, assets }));
+    return;
+  }
+
   // /ping endpoint — keepalive
   if (req.url === '/ping') {
     res.writeHead(200, { 'Content-Type': 'text/plain', 'Access-Control-Allow-Origin': '*' });
@@ -1899,6 +1911,109 @@ function runOracleDetector(title, wiki, key) {
       '⚡ Тип: REACTION — подія вже відбувається'
     );
   }
+}
+
+
+// ════════════════════════════════════════
+// ASSET MAPPER
+// Wikipedia категорії → фінансові активи
+// ════════════════════════════════════════
+
+const COUNTRY_CURRENCIES = {
+  'hungary':'HUF','turkey':'TRY','ukraine':'UAH','russia':'RUB',
+  'china':'CNY','japan':'JPY','india':'INR','brazil':'BRL',
+  'argentina':'ARS','mexico':'MXN','south korea':'KRW',
+  'australia':'AUD','canada':'CAD','united kingdom':'GBP',
+  'european union':'EUR','switzerland':'CHF','norway':'NOK',
+  'poland':'PLN','czech':'CZK','romania':'RON'
+};
+
+const SECTOR_ETFS = {
+  'cryptocurrency':'BTC-USD',
+  'bitcoin':'BTC-USD',
+  'ethereum':'ETH-USD',
+  'artificial intelligence':'QQQ',
+  'semiconductor':'SOXX',
+  'defense':'ITA',
+  'oil':'USO',
+  'gold':'GLD',
+  'bank':'XLF',
+  'pharmaceutical':'XPH',
+  'airline':'JETS',
+  'real estate':'VNQ',
+  'energy':'XLE',
+  'technology':'QQQ',
+  'retail':'XRT',
+};
+
+const KNOWN_COMPANIES = {
+  'apple':'AAPL','microsoft':'MSFT','google':'GOOGL','alphabet':'GOOGL',
+  'amazon':'AMZN','meta':'META','nvidia':'NVDA','tesla':'TSLA',
+  'boeing':'BA','airbus':'AIR.PA','toyota':'TM','volkswagen':'VOW3.DE',
+  'samsung':'005930.KS','sony':'SONY','tencent':'TCEHY','alibaba':'BABA',
+  'jpmorgan':'JPM','goldman sachs':'GS','blackrock':'BLK',
+  'berkshire':'BRK-B','exxon':'XOM','chevron':'CVX',
+  'thatgamecompany':'SONY', // Sony публікує їх ігри
+  'annapurna':'AAPL', // Apple Arcade партнер
+  'ftx':'BTC-USD','binance':'BNB-USD','coinbase':'COIN',
+  'svb':'XLF','credit suisse':'CS','ubs':'UBS',
+  'openai':'MSFT','anthropic':'GOOGL',
+};
+
+function mapAssets(title, articleType, categories, groqAssets) {
+  const assets = new Set();
+  const text = (title + ' ' + (categories||'') + ' ' + (articleType||'')).toLowerCase();
+
+  // 1. Groq вже дав assets — перевіряємо і залишаємо валідні
+  if (groqAssets && Array.isArray(groqAssets)) {
+    groqAssets.forEach(a => {
+      if (a && a.length <= 10 && /^[A-Z0-9.\-]+$/.test(a)) assets.add(a);
+    });
+  }
+
+  // 2. Відомі компанії
+  Object.entries(KNOWN_COMPANIES).forEach(([name, ticker]) => {
+    if (text.includes(name)) assets.add(ticker);
+  });
+
+  // 3. Країни → валюти
+  Object.entries(COUNTRY_CURRENCIES).forEach(([country, currency]) => {
+    if (text.includes(country)) assets.add(currency);
+  });
+
+  // 4. Сектори → ETF
+  Object.entries(SECTOR_ETFS).forEach(([sector, etf]) => {
+    if (text.includes(sector)) assets.add(etf);
+  });
+
+  // 5. Типи статей
+  if (articleType) {
+    const at = articleType.toLowerCase();
+    if (at.includes('геополітика') || at.includes('військові')) {
+      assets.add('GLD'); assets.add('USO');
+    }
+    if (at.includes('бізнес')) assets.add('SPY');
+    if (at.includes('смерть') && text.includes('politic')) assets.add('SPY');
+  }
+
+  return [...assets].slice(0, 5); // максимум 5 активів
+}
+
+// Оновлюємо anomaly запис з mapped assets
+function enrichWithAssets(title, articleType, groqResult) {
+  const assets = mapAssets(
+    title,
+    articleType,
+    '',
+    groqResult?.affected_assets
+  );
+  if (!assets.length) return;
+
+  // Оновлюємо cross_signals якщо є groq результат
+  if (groqResult && assets.length) {
+    console.log('Asset mapping:', title, '->', assets.join(','));
+  }
+  return assets;
 }
 
 connectGlobalUpstream();
