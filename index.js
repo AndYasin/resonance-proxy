@@ -2020,6 +2020,14 @@ function mapAssets(title, articleType, categories, groqAssets) {
     text.includes('representative') || text.includes('governor');
   if (isUSPolitician) { assets.add('SPY'); assets.add('USD'); }
 
+  // Дефолт для політиків без знайдених активів
+  if (assets.size === 0 && articleType) {
+    const at = articleType.toLowerCase();
+    if (at.includes('політик') || at.includes('politic')) assets.add('SPY');
+    if (at.includes('бізнес') || at.includes('business')) assets.add('SPY');
+    if (at.includes('геополіт') || at.includes('geo')) { assets.add('GLD'); assets.add('USO'); }
+  }
+
   return [...assets].slice(0, 5); // максимум 5 активів
 }
 
