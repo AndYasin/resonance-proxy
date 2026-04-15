@@ -1741,295 +1741,36 @@ function scheduleHistoryBatch() {
 scheduleHistoryBatch();
 
 // Також /history/run для ручного запуску
-connectGlobalUpstream();
-
-server.listen(process.env.PORT || 3000, '0.0.0.0', () => {
-  console.log('Resonance proxy on port ' + (process.env.PORT || 3000));
-  console.log('Wikis monitored:', ALL_WIKIS.size, '| Tier1:', TIER1.size, '| Tier2:', TIER2.size, '| Tier3:', TIER3.size);
-  console.log('TG thresholds — Tier1: 4+ editors | Tier2: 5+ editors | Tier3: 6+ editors');
-  if (TELEGRAM_TOKEN) {
-    sendTelegram(
-      '🟢 <b>RESONANCE v7 online</b>\n\n' +
-      '📡 ' + ALL_WIKIS.size + ' Wikipedia мов · real-time\n\n' +
-      '<b>Що надсилаю:</b>\n' +
-      '⚡ <b>WIKI ALERT</b> — 5+ редакторів / 5хв (tier1), важливий тип або 30+ мов\n' +
-      '🔮 <b>LLM Signal</b> — Groq класифікував з confidence >= 0.8\n' +
-      '📊 <b>Daily Digest</b> — топ сигнали 2x на добу (6:00 і 18:00 UTC)\n' +
-      '🌿 <b>BRANCH</b> — history batch виявив підготовку до події (T-X днів)\n' +
-      '🕸 <b>Graph Signal</b> — 2+ пов\'язаних Wikidata вузли активні одночасно\n' +
-      '📈 <b>Trends</b> — Wikipedia burst + Google Trends в 2+ країнах\n\n' +
-      '<b>Не надсилаю:</b> спорт без macro impact, culture, Wikipedia routine\n\n' +
-      '<b>Як читати LLM сигнал:</b>\n' +
-      'strength — впевненість Groq (0-1)\n' +
-      'pimino — потенціал поширення події (0-1)\n' +
-      'assets — конкретні тікери/валюти\n' +
-      'direction — LONG/SHORT/STRADDLE/WATCH\n\n' +
-      '<b>BRANCH vs FLY:</b>\n' +
-      '🌿 BRANCH = подія готується, є T-X сигнал → можна діяти до\n' +
-      '🪰 FLY = подія вже сталась, реакція ринку → моментум або запізно\n\n' +
-      '⚙️ Tier1 (en/de/fr): 5+ ред · Tier2 (uk/ar): 6+ · Tier3 (hi/he): 7+'
-    );
-  }
-});
 
 // ════════════════════════════════════════
-// GITHUB EVENTS — зірочки і форки
+// ORACLE DETECTOR
+// Визначає паттерн BRANCH vs FLY
+// на основі поведінки редакторів
 // ════════════════════════════════════════
 
-const githubCache = { items: [], fetchedAt: 0 };
-const githubStars = {}; // repo -> {stars, prev, delta, fetchedAt}
+// Фінансові keywords в коментарях
+const FINANCIAL_KW = ['ipo','funding','acquisition','merger','bankrupt','fraud',
+  'sec filing','s-1','listing','offering','chapter 11','liquidity','collapse',
+  'initial public','went public','arrested','indicted','takeover'];
 
-async function fetchGithubTrending() {
-  return new Promise((resolve) => {
-    // GitHub public events - no auth needed, 60 req/hour
-    const path = '/repos?q=stars:>100&sort=stars&order=desc&per_page=50&type=repositories';
-    // Use search API for trending
-    const searchPath = '/search/repositories?q=stars:>50+pushed:>' + getRecentDate(1) + '&sort=stars&order=desc&per_page=50';
+// Паніка/реакція keywords (FLY сигнали)
+const PANIC_KW = ['reverted','undone','breaking','scandal','crisis','hack',
+  'exploit','stolen','emergency','urgent','developing'];
 
-    https.get({
-      hostname: 'api.github.com',
-      path: searchPath,
-      headers: {
-        'User-Agent': 'ResonanceBot/1.0',
-        'Accept': 'application/vnd.github.v3+json'
-      }
-    }, (res) => {
-      let data = ''; res.on('data', c => data += c);
-      res.on('end', () => {
-        try {
-          const json = JSON.parse(data);
-          const items = (json.items || []).map(r => ({
-            name: r.full_name,
-            desc: (r.description || '').slice(0, 80),
-            stars: r.stargazers_count,
-            forks: r.forks_count,
-            lang: r.language || '',
-            topics: (r.topics || []).slice(0, 3),
-            url: r.html_url,
-            pushed: r.pushed_at
-          }));
-          githubCache.items = items;
-          githubCache.fetchedAt = Date.now();
-          console.log('GitHub updated:', items.length, 'repos, top:', items[0]?.name);
-          resolve(items);
-        } catch(e) {
-          console.log('GitHub parse error:', e.message);
-          resolve([]);
-        }
-      });
-    }).on('error', e => { console.log('GitHub fetch error:', e.message); resolve([]); });
-  });
-}
+function detectOraclePattern(title, wiki, anomData) {
+  const { comments, users300, ts300, firstSeen } = anomData;
+  const now = Date.now();
 
-// Get events to track star velocity
-const starVelocity = {}; // repo -> [{t, stars}]
+  if (!comments || !comments.length) return null;
 
-async function fetchGithubEvents() {
-  return new Promise((resolve) => {
-    https.get({
-      hostname: 'api.github.com',
-      path: '/events?per_page=100',
-      headers: { 'User-Agent': 'ResonanceBot/1.0', 'Accept': 'application/vnd.github.v3+json' }
-    }, (res) => {
-      let data = ''; res.on('data', c => data += c);
-      res.on('end', () => {
-        try {
-          const events = JSON.parse(data);
-          const now = Date.now();
-          const spikes = {};
+  const commentsText = comments.join(' ').toLowerCase();
+  const uniqueEditors = users300 ? users300.size : 0;
+  const totalEdits = ts300 ? ts300.length : 0;
+  const spanMin = (now - (firstSeen || now)) / 60000;
 
-          events.forEach(ev => {
-            if (ev.type === 'WatchEvent' || ev.type === 'ForkEvent') {
-              const repo = ev.repo.name;
-              if (!spikes[repo]) spikes[repo] = { watches: 0, forks: 0, url: 'https://github.com/' + repo };
-              if (ev.type === 'WatchEvent') spikes[repo].watches++;
-              if (ev.type === 'ForkEvent') spikes[repo].forks++;
-            }
-          });
+  // Фінансові коментарі
+  const hasFinancialKW = FINANCIAL_KW.some(kw => commentsText.includes(kw));
+  const hasPanicKW = PANIC_KW.some(kw => commentsText.includes(kw));
 
-          // Find repos with 3+ stars in this batch
-          const hot = Object.entries(spikes)
-            .filter(([, v]) => v.watches >= 2 || v.forks >= 2)
-            .sort((a, b) => (b[1].watches + b[1].forks) - (a[1].watches + a[1].forks))
-            .slice(0, 20)
-            .map(([name, v]) => ({ name, ...v, score: v.watches * 2 + v.forks }));
-
-          resolve(hot);
-        } catch(e) { resolve([]); }
-      });
-    }).on('error', () => resolve([]));
-  });
-}
-
-function getRecentDate(daysAgo) {
-  const d = new Date(Date.now() - daysAgo * 86400000);
-  return d.toISOString().split('T')[0];
-}
-
-// GitHub event stream cache
-let githubEventCache = { items: [], fetchedAt: 0 };
-
-async function pollGithub() {
-  try {
-    const [trending, events] = await Promise.all([
-      fetchGithubTrending(),
-      fetchGithubEvents()
-    ]);
-    githubEventCache = { trending, events, fetchedAt: Date.now() };
-  } catch(e) {
-    console.log('GitHub poll error:', e.message);
-  }
-}
-
-pollGithub();
-setInterval(pollGithub, 120000); // every 2 min (stay under rate limit)
-
-
-// ════════════════════════════════════════
-// BINANCE — об'єми торгів
-// ════════════════════════════════════════
-
-let binanceWs = null;
-const binanceData = {}; // symbol -> {price, vol1m, vol5m, trades1m, anomaly}
-const binanceSubs = ['btcusdt', 'ethusdt', 'bnbusdt', 'solusdt', 'xrpusdt',
-                     'adausdt', 'dogeusdt', 'avaxusdt', 'maticusdt', 'linkusdt',
-                     'dotusdt', 'uniusdt', 'atomusdt', 'ltcusdt', 'nearusdt'];
-
-function connectBinance() {
-  const streams = binanceSubs.map(s => s + '@aggTrade').join('/');
-  const WS_URL = 'wss://stream.binance.com:9443/stream?streams=' + streams;
-
-  try {
-    // Use https to get initial data, then use polling (WebSocket needs ws module)
-    // Fetch 24hr stats via REST as fallback
-    fetchBinanceStats();
-  } catch(e) {
-    console.log('Binance init error:', e.message);
-  }
-}
-
-let binanceStatsCache = { items: [], fetchedAt: 0 };
-
-async function fetchBinanceStats() {
-  return new Promise((resolve) => {
-    const symbols = binanceSubs.map(s => s.toUpperCase());
-    const query = '?symbols=' + encodeURIComponent(JSON.stringify(symbols));
-
-    https.get({
-      hostname: 'api.binance.com',
-      path: '/api/v3/ticker/24hr' + query,
-      headers: { 'User-Agent': 'ResonanceBot/1.0' }
-    }, (res) => {
-      let data = ''; res.on('data', c => data += c);
-      res.on('end', () => {
-        try {
-          const parsed = JSON.parse(data);
-          // Binance returns error object if rate limited, not array
-          if (!Array.isArray(parsed)) {
-            console.log('Binance rate limit or error:', parsed.msg || JSON.stringify(parsed).slice(0,80));
-            resolve([]);
-            return;
-          }
-          const tickers = parsed;
-          const now = Date.now();
-
-          const items = tickers.map(t => {
-            const sym = t.symbol;
-            const price = parseFloat(t.lastPrice);
-            const change = parseFloat(t.priceChangePercent);
-            const vol = parseFloat(t.quoteVolume); // USDT volume
-            const trades = parseInt(t.count);
-
-            // Store history for anomaly detection
-            if (!binanceData[sym]) binanceData[sym] = { history: [] };
-            binanceData[sym].history.push({ vol, price, t: now });
-            binanceData[sym].history = binanceData[sym].history.filter(h => now - h.t < 3600000);
-
-            // Calculate volume anomaly
-            const hist = binanceData[sym].history;
-            const avgVol = hist.length > 1
-              ? hist.slice(0, -1).reduce((s, h) => s + h.vol, 0) / (hist.length - 1)
-              : vol;
-            const volRatio = avgVol > 0 ? vol / avgVol : 1;
-
-            return {
-              symbol: sym,
-              price,
-              change,
-              vol: Math.round(vol),
-              trades,
-              volRatio: +volRatio.toFixed(2),
-              isAnomaly: Math.abs(change) >= 3 || volRatio >= 2
-            };
-          })
-          .sort((a, b) => Math.abs(b.change) - Math.abs(a.change));
-
-          binanceStatsCache = { items, fetchedAt: now };
-          console.log('Binance updated:', items.length, 'pairs, top mover:', items[0]?.symbol, items[0]?.change + '%');
-
-          // Save anomalies to Supabase
-          const anomalies = items.filter(t => t.isAnomaly);
-          if (anomalies.length > 0) {
-            anomalies.forEach(t => {
-              supabaseInsert('binance_snapshots', {
-                symbol: t.symbol,
-                price: t.price,
-                change_pct: t.change,
-                volume: t.vol,
-                is_anomaly: true
-              });
-            });
-          }
-          // Save all snapshots every 10 min (not every minute to save space)
-          if (now % 600000 < 180000) {
-            items.forEach(t => {
-              supabaseInsert('binance_snapshots', {
-                symbol: t.symbol,
-                price: t.price,
-                change_pct: t.change,
-                volume: t.vol,
-                is_anomaly: t.isAnomaly
-              });
-            });
-          }
-
-          resolve(items);
-        } catch(e) {
-          console.log('Binance parse error:', e.message, data.slice(0, 100));
-          resolve([]);
-        }
-      });
-    }).on('error', e => { console.log('Binance fetch error:', e.message); resolve([]); });
-  });
-}
-
-connectBinance();
-setInterval(fetchBinanceStats, 180000); // every 3 min to avoid rate limits
-
-
-// ════════════════════════════════════════
-// CROSS-SIGNAL DETECTION
-// ════════════════════════════════════════
-
-function findCrossSignals() {
-  const signals = [];
-  const wikiTitles = Object.keys(anomWindow).map(k => k.split(':').slice(1).join(':').toLowerCase());
-
-  // Check if any Binance anomaly matches Wikipedia topic
-  if (binanceStatsCache.items) {
-    binanceStatsCache.items.filter(t => t.isAnomaly).forEach(ticker => {
-      const sym = ticker.symbol.replace('USDT','').toLowerCase();
-      const wikiMatch = wikiTitles.find(t => t.includes(sym));
-      if (wikiMatch) {
-        signals.push({
-          type: 'WIKI+CRYPTO',
-          title: ticker.symbol + ' & ' + wikiMatch,
-          detail: ticker.change + '% · wiki активна',
-          color: '#64ffda'
-        });
-      }
-    });
-  }
-
-  return signals;
-}
+  // Детектуємо мови в коментарях (non-ASCII = не англійська)
+  const nonAsciiComments = comments.filter(c => /[^
