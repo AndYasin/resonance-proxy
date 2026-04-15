@@ -1986,14 +1986,32 @@ function mapAssets(title, articleType, categories, groqAssets) {
     if (text.includes(sector)) assets.add(etf);
   });
 
-  // 5. Типи статей
+  // 5. Типи статей (кирилиця і латиниця)
   if (articleType) {
     const at = articleType.toLowerCase();
-    if (at.includes('геополітика') || at.includes('військові')) {
+    if (at.includes('геополіт') || at.includes('військ') || at.includes('geo') || at.includes('milit')) {
       assets.add('GLD'); assets.add('USO');
     }
-    if (at.includes('бізнес')) assets.add('SPY');
-    if (at.includes('смерть') && text.includes('politic')) assets.add('SPY');
+    if (at.includes('бізнес') || at.includes('business')) assets.add('SPY');
+    if ((at.includes('смерть') || at.includes('death')) && text.includes('politic')) assets.add('SPY');
+    if (at.includes('політик') || at.includes('politic')) {
+      // Шукаємо країну в заголовку
+      Object.entries(COUNTRY_CURRENCIES).forEach(([country, currency]) => {
+        if (title.toLowerCase().includes(country)) assets.add(currency);
+      });
+    }
+  }
+
+  // 6. Орбан/Угорщина — явний кейс
+  const titleLow = title.toLowerCase();
+  if (titleLow.includes('orbán') || titleLow.includes('orban') || titleLow.includes('hungarian') || titleLow.includes('hungary') || titleLow.includes('magyar') || titleLow.includes('fidesz')) {
+    assets.add('HUF');
+  }
+  if (titleLow.includes('erdoğan') || titleLow.includes('erdogan') || titleLow.includes('turkey') || titleLow.includes('turkish')) {
+    assets.add('TRY');
+  }
+  if (titleLow.includes('ukraine') || titleLow.includes('zelensky') || titleLow.includes('ukrainian')) {
+    assets.add('UAH'); assets.add('GLD');
   }
 
   return [...assets].slice(0, 5); // максимум 5 активів
