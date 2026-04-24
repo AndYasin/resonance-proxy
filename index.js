@@ -460,6 +460,33 @@ async function checkAnomaly(title, wiki, user, isBot) {
   const hits300 = w.ts300.length;
   const uniq300 = w.users300.size;
 
+  // ── TRACKED ENTITY check ──
+  const tracked = checkTracked(title);
+  if (tracked && !w.firedTracked && uniq300 >= 1) {
+    w.firedTracked = true;
+    console.log('TRACKED HIT:', title, '|', tracked.entity_type, '|', tracked.related_ticker);
+    supabaseInsert('cross_signals', {
+      type: 'TRACKED+HIT',
+      title,
+      detail: tracked.entity_type + ' · ' + tracked.category + ' · ticker:' + tracked.related_ticker + ' · imp:' + tracked.importance + (tracked.notes ? ' · ' + tracked.notes : ''),
+      wiki_title: title,
+      crypto_symbol: tracked.related_ticker,
+      score: tracked.importance * 10
+    }, 'title,type');
+
+    // Telegram для importance >= 9
+    if (tracked.importance >= 9 && TELEGRAM_TOKEN) {
+      sendTelegram(
+        '🎯 <b>TRACKED: ' + title + '</b>\n\n' +
+        tracked.entity_type + ' · ' + tracked.category + '\n' +
+        '💹 Ticker: <b>' + tracked.related_ticker + '</b>\n' +
+        '👥 ' + uniq300 + ' редакторів · ' + hits300 + ' правок\n' +
+        (tracked.notes ? '📝 ' + tracked.notes + '\n' : '') +
+        'ℹ️ Importance: ' + tracked.importance + '/10'
+      );
+    }
+  }
+
   const tgThreshold    = getTgThreshold(wiki);
   const spikeThreshold = getSpikeThreshold(wiki);
   const alertKey = key + ':' + Math.floor(now / 300000);
@@ -2225,6 +2252,51 @@ function scheduleBaselineFlush() {
 scheduleBaselineFlush();
 
 // Endpoint для ручного запуску + перегляду
+
+// ════════════════════════════════════════
+// TRACKED ENTITIES — focused detection
+// ════════════════════════════════════════
+
+const trackedEntities = new Map(); // wiki_title -> {entity_type, category, country, related_ticker, importance, notes}
+
+async function loadTrackedEntities() {
+  return new Promise((resolve) => {
+    const url = SUPABASE_URL + '/rest/v1/tracked_entities?order=importance.desc';
+    https.get(url, {
+      headers: { 'apikey': SUPABASE_KEY, 'Authorization': 'Bearer ' + SUPABASE_KEY }
+    }, (r) => {
+      let d = ''; r.on('data', c => d += c);
+      r.on('end', () => {
+        try {
+          const rows = JSON.parse(d);
+          if (Array.isArray(rows)) {
+            trackedEntities.clear();
+            rows.forEach(row => trackedEntities.set(row.wiki_title, row));
+            console.log('Tracked entities loaded:', trackedEntities.size);
+          }
+        } catch(e) {}
+        resolve();
+      });
+    }).on('error', () => resolve());
+  });
+}
+
+// Перевіряємо чи title в tracked list (exact або fuzzy match)
+function checkTracked(title) {
+  if (trackedEntities.has(title)) return trackedEntities.get(title);
+  // Fuzzy — без діакритики
+  const normalize = s => s.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  const normTitle = normalize(title);
+  for (const [key, val] of trackedEntities) {
+    if (normalize(key) === normTitle) return val;
+  }
+  return null;
+}
+
+// Завантажуємо при старті і оновлюємо кожну годину
+loadTrackedEntities();
+setInterval(loadTrackedEntities, 3600000);
+
 connectGlobalUpstream();
 
 server.listen(process.env.PORT || 3000, '0.0.0.0', () => {
