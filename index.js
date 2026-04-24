@@ -503,7 +503,7 @@ async function checkAnomaly(title, wiki, user, isBot) {
         score: Math.round(score),
         is_trending: trendPct !== null,
         trend_pct: trendPct
-      });
+      }, 'title,wiki');
     }).catch(() => {
       // Fallback — записуємо без деталей
       supabaseInsert('anomalies', {
@@ -511,7 +511,7 @@ async function checkAnomaly(title, wiki, user, isBot) {
         edits: hits300, editors: uniq300,
         lang_count: 0, article_type: '', url: wikiUrl,
         score: uniq300 * 3 + hits300, is_trending: false, trend_pct: null
-      });
+      }, 'title,wiki');
     });
   }
 
@@ -543,10 +543,10 @@ async function checkAnomaly(title, wiki, user, isBot) {
       lang_count: info.langCount,
       article_type: (info.type || '').replace(/[^a-zA-Zа-яА-ЯіІїЇєЄ\s]/g,'').trim(),
       url: 'https://' + lang + '.wikipedia.org/wiki/' + encodeURIComponent(title.replace(/ /g,'_')),
-      score: (editors300 || editors60) * 3 + (hits300 || hits60),
+      score: (uniq300 || uniq60) * 3 + (hits300 || hits60),
       is_trending: info.langCount >= 50,
       trend_pct: null
-    });
+    }, 'title,wiki');
 
     // Strict importance filter for Telegram
     const isImportant =
