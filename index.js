@@ -1039,6 +1039,30 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+
+  // /tracked/expand — розширити через Wikidata
+  if (req.url === '/tracked/expand') {
+    res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+    res.end(JSON.stringify({ status: 'started', message: 'expansion running in background, check logs' }));
+    expandTrackedViaWikidata().then(n => console.log('Expansion result:', n, 'added'));
+    return;
+  }
+
+  // /tracked/list — список tracked entities
+  if (req.url.startsWith('/tracked/list')) {
+    const params = new URLSearchParams(req.url.split('?')[1]||'');
+    const type = params.get('type') || '';
+    const url = SUPABASE_URL + '/rest/v1/tracked_entities?order=importance.desc' + (type ? '&entity_type=eq.'+type : '');
+    https.get(url, { headers: { 'apikey': SUPABASE_KEY, 'Authorization': 'Bearer ' + SUPABASE_KEY } }, (r2) => {
+      let d = ''; r2.on('data', c => d += c);
+      r2.on('end', () => {
+        res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+        res.end(d);
+      });
+    }).on('error', () => { res.writeHead(500); res.end('{}'); });
+    return;
+  }
+
   // /ping endpoint — keepalive
   if (req.url === '/ping') {
     res.writeHead(200, { 'Content-Type': 'text/plain', 'Access-Control-Allow-Origin': '*' });
@@ -2296,6 +2320,95 @@ function checkTracked(title) {
 // Завантажуємо при старті і оновлюємо кожну годину
 loadTrackedEntities();
 setInterval(loadTrackedEntities, 3600000);
+
+
+// ════════════════════════════════════════
+// TRACKED EXPAND — Wikidata subsidiaries
+// ════════════════════════════════════════
+
+async function expandTrackedViaWikidata() {
+  console.log('Expanding tracked entities via Wikidata...');
+  const url = SUPABASE_URL + '/rest/v1/tracked_entities?order=importance.desc';
+  const parents = await new Promise((resolve) => {
+    https.get(url, { headers: { 'apikey': SUPABASE_KEY, 'Authorization': 'Bearer ' + SUPABASE_KEY } }, (r) => {
+      let d = ''; r.on('data', c => d += c);
+      r.on('end', () => { try { resolve(JSON.parse(d)); } catch(e) { resolve([]); } });
+    }).on('error', () => resolve([]));
+  });
+
+  const onlyTankers = parents.filter(p => !(p.notes||'').startsWith('SUB of'));
+  console.log('Tankers to expand:', onlyTankers.length);
+
+  const seen = new Set(parents.map(p => p.wiki_title));
+  let added = 0;
+
+  for (const parent of onlyTankers.slice(0, 40)) { // обмежуємо 40 за запуск
+    // Get QID
+    const qidPath = '/w/api.php?action=wbsearchentities&search='
+      + encodeURIComponent(parent.wiki_title) + '&language=en&limit=1&format=json';
+    const qid = await new Promise((resolve) => {
+      https.get({ hostname: 'www.wikidata.org', path: qidPath, headers: { 'User-Agent': 'ResonanceBot/1.0' } }, (r) => {
+        let d = ''; r.on('data', c => d += c);
+        r.on('end', () => { try { resolve(JSON.parse(d).search?.[0]?.id || null); } catch(e) { resolve(null); } });
+      }).on('error', () => resolve(null));
+    });
+    if (!qid) continue;
+
+    // SPARQL related
+    const sparql = 'SELECT DISTINCT ?relLabel ?relatedLabel WHERE {'
+      + 'VALUES ?item { wd:' + qid + ' } '
+      + 'VALUES ?rel { wdt:P355 wdt:P749 wdt:P127 wdt:P3320 wdt:P169 wdt:P1037 wdt:P488 wdt:P112 wdt:P159 } '
+      + '{ ?item ?rel ?related . } UNION { ?related ?rel ?item . } '
+      + '?related rdfs:label ?relatedLabel FILTER(LANG(?relatedLabel)=\'en\') . '
+      + '?relProp wikibase:directClaim ?rel ; rdfs:label ?relLabel FILTER(LANG(?relLabel)=\'en\') . '
+      + 'FILTER(STRLEN(?relatedLabel) < 60) } LIMIT 25';
+
+    const related = await new Promise((resolve) => {
+      const url = '/sparql?query=' + encodeURIComponent(sparql) + '&format=json';
+      https.get({ hostname: 'query.wikidata.org', path: url,
+        headers: { 'User-Agent': 'ResonanceBot/1.0', 'Accept': 'application/json' }
+      }, (r) => {
+        let d = ''; r.on('data', c => d += c);
+        r.on('end', () => {
+          try {
+            const bindings = JSON.parse(d).results?.bindings || [];
+            resolve(bindings.map(b => ({
+              title: b.relatedLabel?.value,
+              relation: b.relLabel?.value || ''
+            })).filter(x => x.title));
+          } catch(e) { resolve([]); }
+        });
+      }).on('error', () => resolve([]));
+      setTimeout(() => resolve([]), 10000);
+    });
+
+    for (const rel of related) {
+      if (!rel.title || rel.title.length < 3 || rel.title.length > 60) continue;
+      if (/^\d{4}$/.test(rel.title)) continue;
+      if (['United States','Human','Company','Corporation','Private company','Public company'].includes(rel.title)) continue;
+      if (seen.has(rel.title)) continue;
+      seen.add(rel.title);
+
+      supabaseInsert('tracked_entities', {
+        wiki_title: rel.title,
+        entity_type: 'SUB',
+        category: parent.category,
+        country: parent.country,
+        related_ticker: parent.related_ticker,
+        importance: Math.max(3, parent.importance - 3),
+        notes: 'SUB of ' + parent.wiki_title + ' · ' + rel.relation
+      }, 'wiki_title');
+      added++;
+    }
+
+    console.log('Expanded', parent.wiki_title, '->', related.length, 'related');
+    // Rate limit Wikidata — 2с
+    await new Promise(r => setTimeout(r, 2000));
+  }
+
+  console.log('Expansion done — added:', added);
+  return added;
+}
 
 connectGlobalUpstream();
 
