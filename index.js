@@ -504,6 +504,19 @@ async function checkAnomaly(title, wiki, user, isBot) {
         is_trending: trendPct !== null,
         trend_pct: trendPct
       }, 'title,wiki');
+
+      // ── Baseline tracking + content delta ──
+      updateBaseline(title, wiki, Array.from(w.users300)[0]);
+      saveContentDelta(title, wiki, Array.from(w.users300)[0], w.comments[0]||'');
+
+      // ── Oracle detector ──
+      runOracleDetector(title, wiki, key);
+
+      // ── Prediction markets ──
+      checkPredictionSignals(title, wiki, uniq300, Math.round(score));
+
+      // ── Wikidata граф ──
+      setTimeout(() => checkWikidataGraph(title, wiki, Math.round(score)), 3000);
     }).catch(() => {
       // Fallback — записуємо без деталей
       supabaseInsert('anomalies', {
