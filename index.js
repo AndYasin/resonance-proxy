@@ -461,33 +461,6 @@ async function checkAnomaly(title, wiki, user, isBot) {
   const hits300 = w.ts300.length;
   const uniq300 = w.users300.size;
 
-  // ── TRACKED ENTITY check ──
-  const tracked = checkTracked(title);
-  if (tracked && !w.firedTracked && uniq300 >= 1) {
-    w.firedTracked = true;
-    console.log('TRACKED HIT:', title, '|', tracked.entity_type, '|', tracked.related_ticker);
-    supabaseInsert('cross_signals', {
-      type: 'TRACKED+HIT',
-      title,
-      detail: tracked.entity_type + ' · ' + tracked.category + ' · ticker:' + tracked.related_ticker + ' · imp:' + tracked.importance + (tracked.notes ? ' · ' + tracked.notes : ''),
-      wiki_title: title,
-      crypto_symbol: tracked.related_ticker,
-      score: tracked.importance * 10
-    }, 'title,type');
-
-    // Telegram для importance >= 9
-    if (tracked.importance >= 9 && TELEGRAM_TOKEN) {
-      sendTelegram(
-        '🎯 <b>TRACKED: ' + title + '</b>\n\n' +
-        tracked.entity_type + ' · ' + tracked.category + '\n' +
-        '💹 Ticker: <b>' + tracked.related_ticker + '</b>\n' +
-        '👥 ' + uniq300 + ' редакторів · ' + hits300 + ' правок\n' +
-        (tracked.notes ? '📝 ' + tracked.notes + '\n' : '') +
-        'ℹ️ Importance: ' + tracked.importance + '/10'
-      );
-    }
-  }
-
   const tgThreshold    = getTgThreshold(wiki);
   const spikeThreshold = getSpikeThreshold(wiki);
   const alertKey = key + ':' + Math.floor(now / 300000);
