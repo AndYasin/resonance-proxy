@@ -980,6 +980,25 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+
+  // /baseline/flush — ручний запуск
+  if (req.url === '/baseline/flush') {
+    flushBaselines();
+    res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+    res.end(JSON.stringify({ status: 'flushed', entities: Object.keys(baselineMemory).length }));
+    return;
+  }
+
+  // /baseline/size — скільки entities в пам'яті
+  if (req.url === '/baseline/size') {
+    res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+    res.end(JSON.stringify({ 
+      memory_size: Object.keys(baselineMemory).length,
+      sample: Object.keys(baselineMemory).slice(0,10)
+    }));
+    return;
+  }
+
   // /ping endpoint — keepalive
   if (req.url === '/ping') {
     res.writeHead(200, { 'Content-Type': 'text/plain', 'Access-Control-Allow-Origin': '*' });
@@ -2048,6 +2067,151 @@ function enrichWithAssets(title, articleType, groqResult) {
   return assets;
 }
 
+
+// ════════════════════════════════════════
+// BASELINE TRACKING + CONTENT DELTA
+// ════════════════════════════════════════
+
+// Отримуємо diff через Wikipedia API
+async function fetchWikiDiff(title, lang) {
+  return new Promise((resolve) => {
+    const path = '/w/api.php?action=query&prop=revisions&titles='
+      + encodeURIComponent(title)
+      + '&rvprop=content|comment|size&rvlimit=2&rvdiffto=prev&format=json';
+    https.get({
+      hostname: lang + '.wikipedia.org', path,
+      headers: { 'User-Agent': 'ResonanceBot/1.0' }
+    }, (r) => {
+      let raw = ''; r.on('data', d => raw += d);
+      r.on('end', () => {
+        try {
+          const page = Object.values(JSON.parse(raw).query?.pages || {})[0];
+          if (!page?.revisions?.length) { resolve(null); return; }
+          const rev = page.revisions[0];
+          resolve({
+            size: rev.size || 0,
+            comment: rev.comment || '',
+            diff: rev.diff?.['*'] || ''
+          });
+        } catch(e) { resolve(null); }
+      });
+    }).on('error', () => resolve(null));
+  });
+}
+
+// Парсимо diff HTML щоб витягти added/removed text
+function parseDiffText(diffHtml) {
+  if (!diffHtml) return { added: '', removed: '', section: '' };
+  // Додані рядки — td class="diff-addedline"
+  const addedMatches = [...diffHtml.matchAll(/<td[^>]*class="[^"]*diff-addedline[^"]*"[^>]*>([\s\S]*?)<\/td>/g)];
+  const removedMatches = [...diffHtml.matchAll(/<td[^>]*class="[^"]*diff-deletedline[^"]*"[^>]*>([\s\S]*?)<\/td>/g)];
+  const stripTags = s => s.replace(/<[^>]+>/g, '').replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').trim();
+  const added = addedMatches.map(m => stripTags(m[1])).filter(Boolean).join(' ').slice(0, 500);
+  const removed = removedMatches.map(m => stripTags(m[1])).filter(Boolean).join(' ').slice(0, 500);
+  // Секція — з comment типу /* Funding */
+  return { added, removed, section: '' };
+}
+
+// Зберігаємо content delta
+async function saveContentDelta(title, wiki, editor, comment) {
+  const lang = wiki.replace('wiki','') || 'en';
+
+  // Спрощена версія — без diff HTML (він занадто великий)
+  // Витягуємо секцію з comment /* Section */
+  const sectionMatch = comment.match(/\/\*\s*([^*]+)\s*\*\//);
+  const section = sectionMatch ? sectionMatch[1].trim() : '';
+
+  // Беремо останні 2 ревізії для розрахунку delta_bytes
+  const path = '/w/api.php?action=query&prop=revisions&titles='
+    + encodeURIComponent(title)
+    + '&rvprop=size|comment&rvlimit=2&format=json';
+
+  return new Promise((resolve) => {
+    https.get({
+      hostname: lang + '.wikipedia.org', path,
+      headers: { 'User-Agent': 'ResonanceBot/1.0' }
+    }, (r) => {
+      let raw = ''; r.on('data', d => raw += d);
+      r.on('end', () => {
+        try {
+          const page = Object.values(JSON.parse(raw).query?.pages || {})[0];
+          const revs = page?.revisions || [];
+          const deltaBytes = revs.length >= 2 ? (revs[0].size - revs[1].size) : 0;
+
+          supabaseInsert('content_deltas', {
+            title: title.slice(0, 200),
+            wiki,
+            editor: (editor||'').slice(0, 100),
+            added_text: null, // не тягнемо diff для економії
+            removed_text: null,
+            section: section.slice(0, 100),
+            delta_bytes: deltaBytes
+          });
+          resolve({ deltaBytes, section });
+        } catch(e) { resolve(null); }
+      });
+    }).on('error', () => resolve(null));
+    setTimeout(() => resolve(null), 5000);
+  });
+}
+
+// Baseline — оновлюємо профіль статті
+function updateBaseline(title, wiki, editor) {
+  // Просто додаємо в пам'ять — батч запишеться щоночі
+  if (!baselineMemory[title+'|'+wiki]) {
+    baselineMemory[title+'|'+wiki] = { edits: 0, editors: new Set(), hours: {}, lastSeen: 0 };
+  }
+  const b = baselineMemory[title+'|'+wiki];
+  b.edits++;
+  if (editor) b.editors.add(editor);
+  const hour = new Date().getUTCHours();
+  b.hours[hour] = (b.hours[hour]||0) + 1;
+  b.lastSeen = Date.now();
+}
+
+const baselineMemory = {};
+
+// Щоночі пишемо baseline в Supabase
+async function flushBaselines() {
+  console.log('Flushing baselines:', Object.keys(baselineMemory).length, 'entities');
+  const entries = Object.entries(baselineMemory).slice(0, 500); // обмежуємо щоб не перевантажити
+  for (const [key, b] of entries) {
+    const [title, wiki] = key.split('|');
+    const typicalHours = Object.entries(b.hours)
+      .sort((a,b)=>b[1]-a[1])
+      .slice(0,5)
+      .map(([h])=>parseInt(h));
+
+    supabaseInsert('baseline_profiles', {
+      entity_type: 'article',
+      entity_key: key,
+      avg_daily_edits: b.edits / 30,
+      avg_daily_editors: b.editors.size / 30,
+      typical_hours: typicalHours,
+      total_edits_30d: b.edits,
+      last_seen: new Date(b.lastSeen).toISOString()
+    }, 'entity_key');
+  }
+  // Очищаємо після flush
+  Object.keys(baselineMemory).forEach(k => delete baselineMemory[k]);
+}
+
+// Запускаємо flush о 3:00 UTC щодня
+function scheduleBaselineFlush() {
+  const now = new Date();
+  const next3am = new Date(now);
+  next3am.setUTCHours(3, 0, 0, 0);
+  if (next3am <= now) next3am.setUTCDate(next3am.getUTCDate() + 1);
+  const msUntil = next3am - now;
+  console.log('Baseline flush scheduled in', Math.round(msUntil/3600000), 'hours');
+  setTimeout(() => {
+    flushBaselines();
+    setInterval(flushBaselines, 86400000);
+  }, msUntil);
+}
+scheduleBaselineFlush();
+
+// Endpoint для ручного запуску + перегляду
 connectGlobalUpstream();
 
 server.listen(process.env.PORT || 3000, '0.0.0.0', () => {
