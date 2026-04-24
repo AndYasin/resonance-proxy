@@ -279,6 +279,7 @@ function getSpikeThreshold(wiki) {
 
 const anomWindow = {};
 const sentAlerts = {};
+const sentTrackedHits = {};
 const pvcache = {};
 
 // ── TELEGRAM ──
@@ -1221,6 +1222,37 @@ function connectGlobalUpstream() {
                 data.title && !data.title.includes(':') &&
                 !/(^List of|^Deaths in|^Nekrolog|^Список|^Тисяча|^\d{4} in |^\d{4}–|^Index of|^Outline of)/i.test(data.title)) {
               checkAnomaly(data.title, data.wiki, data.user, data.bot);
+
+              // Tracked entity — швидка перевірка на КОЖНІЙ правці
+              if (!looksLikeBot(data.user, data.bot)) {
+                const tracked = checkTracked(data.title);
+                if (tracked) {
+                  const key = data.wiki + ':' + data.title;
+                  if (!sentTrackedHits[key] || Date.now() - sentTrackedHits[key] > 3600000) {
+                    sentTrackedHits[key] = Date.now();
+                    console.log('TRACKED HIT (SSE):', data.title, '|', tracked.entity_type, '|', tracked.related_ticker);
+                    supabaseInsert('cross_signals', {
+                      type: 'TRACKED+HIT',
+                      title: data.title,
+                      detail: tracked.entity_type + ' · ' + tracked.category + ' · ticker:' + tracked.related_ticker + ' · imp:' + tracked.importance + (tracked.notes ? ' · ' + tracked.notes : '') + ' · user:' + (data.user||'?'),
+                      wiki_title: data.title,
+                      crypto_symbol: tracked.related_ticker,
+                      score: tracked.importance * 10
+                    }, 'title,type');
+
+                    if (tracked.importance >= 9 && TELEGRAM_TOKEN) {
+                      sendTelegram(
+                        '🎯 <b>TRACKED: ' + data.title + '</b>\n\n' +
+                        tracked.entity_type + ' · ' + tracked.category + '\n' +
+                        '💹 Ticker: <b>' + tracked.related_ticker + '</b>\n' +
+                        '✏️ Editor: ' + (data.user||'?') + '\n' +
+                        (tracked.notes ? '📝 ' + tracked.notes + '\n' : '') +
+                        'ℹ️ Importance: ' + tracked.importance + '/10'
+                      );
+                    }
+                  }
+                }
+              }
               const msg = 'data: ' + JSON.stringify({
                 title: data.title, wiki: data.wiki,
                 user: data.user, bot: data.bot,
