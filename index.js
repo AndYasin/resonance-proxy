@@ -2482,6 +2482,64 @@ const BACKTEST_EVENTS = [
   { date: '2024-01-10', title: 'Bitcoin', lang: 'en', type: 'CRYPTO', ticker: 'BTC-USD', expected_pattern: 'BRANCH', importance: 10 },
   { date: '2022-11-30', title: 'ChatGPT', lang: 'en', type: 'PRODUCT', ticker: 'MSFT', expected_pattern: 'FLY', importance: 10 },
   { date: '2025-01-19', title: 'TikTok', lang: 'en', type: 'REGULATORY', ticker: 'META', expected_pattern: 'FLY', importance: 9 },
+
+  // M&A
+  { date: '2022-10-27', title: 'Twitter, Inc.', lang: 'en', type: 'MA', ticker: 'TSLA', expected_pattern: 'BRANCH', importance: 9 },
+  { date: '2023-10-13', title: 'Cisco Systems', lang: 'en', type: 'MA', ticker: 'CSCO', expected_pattern: 'BRANCH', importance: 7, notes: 'Splunk acquisition' },
+  { date: '2024-01-26', title: 'Hewlett Packard Enterprise', lang: 'en', type: 'MA', ticker: 'HPE', expected_pattern: 'BRANCH', importance: 6, notes: 'Juniper deal' },
+  { date: '2025-05-30', title: 'OpenAI', lang: 'en', type: 'CORPORATE', ticker: 'MSFT', expected_pattern: 'BRANCH', importance: 9, notes: 'io acquisition' },
+  
+  // FDA / PHARMA
+  { date: '2023-06-08', title: 'Eli Lilly and Company', lang: 'en', type: 'PHARMA', ticker: 'LLY', expected_pattern: 'BRANCH', importance: 8, notes: 'Mounjaro/Zepbound prep' },
+  { date: '2023-08-08', title: 'Novo Nordisk', lang: 'en', type: 'PHARMA', ticker: 'NVO', expected_pattern: 'BRANCH', importance: 8, notes: 'Wegovy heart trial' },
+  { date: '2024-02-21', title: 'Pfizer', lang: 'en', type: 'EARNINGS', ticker: 'PFE', expected_pattern: 'FLY', importance: 6 },
+
+  // EARNINGS REACTIONS
+  { date: '2023-05-24', title: 'Nvidia', lang: 'en', type: 'EARNINGS', ticker: 'NVDA', expected_pattern: 'FLY', importance: 10, notes: 'AI breakout earnings' },
+  { date: '2024-02-21', title: 'Nvidia', lang: 'en', type: 'EARNINGS', ticker: 'NVDA', expected_pattern: 'FLY', importance: 9 },
+  { date: '2024-02-22', title: 'Eli Lilly and Company', lang: 'en', type: 'EARNINGS', ticker: 'LLY', expected_pattern: 'FLY', importance: 7 },
+  { date: '2024-08-29', title: 'Nvidia', lang: 'en', type: 'EARNINGS', ticker: 'NVDA', expected_pattern: 'FLY', importance: 9 },
+  
+  // BANKRUPTCIES / FAILURES
+  { date: '2023-08-21', title: 'WeWork', lang: 'en', type: 'CRISIS', ticker: null, expected_pattern: 'BRANCH', importance: 8, notes: 'going concern warning' },
+  { date: '2023-11-06', title: 'WeWork', lang: 'en', type: 'CRISIS', ticker: null, expected_pattern: 'FLY', importance: 7, notes: 'Chapter 11 filing' },
+  { date: '2024-04-22', title: 'Boeing', lang: 'en', type: 'CRISIS', ticker: 'BA', expected_pattern: 'FLY', importance: 8, notes: 'Whistleblower events' },
+  { date: '2024-01-05', title: 'Boeing', lang: 'en', type: 'CRISIS', ticker: 'BA', expected_pattern: 'FLY', importance: 9, notes: 'Alaska Airlines door blowout' },
+  
+  // TECH PRODUCT LAUNCHES
+  { date: '2024-09-09', title: 'iPhone 16', lang: 'en', type: 'PRODUCT', ticker: 'AAPL', expected_pattern: 'BRANCH', importance: 7 },
+  { date: '2023-09-12', title: 'iPhone 15', lang: 'en', type: 'PRODUCT', ticker: 'AAPL', expected_pattern: 'BRANCH', importance: 7 },
+  { date: '2024-02-02', title: 'Apple Vision Pro', lang: 'en', type: 'PRODUCT', ticker: 'AAPL', expected_pattern: 'BRANCH', importance: 8 },
+  { date: '2025-02-01', title: 'Grok (chatbot)', lang: 'en', type: 'PRODUCT', ticker: 'TSLA', expected_pattern: 'BRANCH', importance: 7, notes: 'Grok 3' },
+  
+  // ELECTIONS — додаткові
+  { date: '2023-11-19', title: 'Javier Milei', lang: 'en', type: 'ELECTION', ticker: 'ARS', expected_pattern: 'BRANCH', importance: 8, notes: 'Argentina runoff' },
+  { date: '2024-06-30', title: '2024 French legislative election', lang: 'en', type: 'ELECTION', ticker: 'EUR', expected_pattern: 'BRANCH', importance: 8 },
+  { date: '2024-10-27', title: '2024 Japanese general election', lang: 'en', type: 'ELECTION', ticker: 'JPY', expected_pattern: 'BRANCH', importance: 7 },
+  
+  // GEOPOLITICS — додаткові
+  { date: '2024-07-13', title: 'Donald Trump', lang: 'en', type: 'EVENT', ticker: 'SPY', expected_pattern: 'FLY', importance: 9, notes: 'Assassination attempt' },
+  { date: '2025-06-13', title: 'Iran–Israel war', lang: 'en', type: 'GEOPOLITICAL', ticker: 'USO', expected_pattern: 'FLY', importance: 10 },
+  { date: '2024-09-24', title: 'Hezbollah pager explosions', lang: 'en', type: 'GEOPOLITICAL', ticker: 'GLD', expected_pattern: 'FLY', importance: 9 },
+  
+  // CRYPTO
+  { date: '2022-05-09', title: 'Terra (blockchain)', lang: 'en', type: 'CRISIS', ticker: 'BTC-USD', expected_pattern: 'FLY', importance: 10, notes: 'UST collapse' },
+  { date: '2023-06-05', title: 'Binance', lang: 'en', type: 'REGULATORY', ticker: 'BNB-USD', expected_pattern: 'FLY', importance: 9, notes: 'SEC charges' },
+  { date: '2024-05-23', title: 'Ethereum', lang: 'en', type: 'CRYPTO', ticker: 'ETH-USD', expected_pattern: 'BRANCH', importance: 8, notes: 'Spot ETF approval' },
+  
+  // SCANDALS / RESIGNATIONS
+  { date: '2023-08-31', title: 'Mitch McConnell', lang: 'en', type: 'CRISIS', ticker: 'SPY', expected_pattern: 'FLY', importance: 6, notes: 'Health freeze' },
+  { date: '2024-07-21', title: 'Joe Biden', lang: 'en', type: 'POLITICS', ticker: 'SPY', expected_pattern: 'BRANCH', importance: 9, notes: 'Withdrawal from race' },
+  { date: '2025-09-25', title: 'Charlie Kirk', lang: 'en', type: 'EVENT', ticker: null, expected_pattern: 'FLY', importance: 8 },
+  
+  // CORPORATE
+  { date: '2024-01-05', title: 'Claudine Gay', lang: 'en', type: 'CORPORATE', ticker: null, expected_pattern: 'BRANCH', importance: 6, notes: 'Harvard president resignation' },
+  { date: '2024-12-04', title: 'Brian Thompson', lang: 'en', type: 'CRISIS', ticker: 'UNH', expected_pattern: 'FLY', importance: 9, notes: 'UnitedHealth CEO killed' },
+  { date: '2024-09-17', title: 'Hezbollah', lang: 'en', type: 'GEOPOLITICAL', ticker: 'GLD', expected_pattern: 'FLY', importance: 9, notes: 'Pager attacks' },
+  
+  // MARKETS / FED
+  { date: '2024-08-05', title: 'Black Monday', lang: 'en', type: 'CRISIS', ticker: 'SPY', expected_pattern: 'FLY', importance: 9, notes: 'Yen carry trade unwind' },
+  { date: '2025-04-09', title: '2025 stock market crash', lang: 'en', type: 'CRISIS', ticker: 'SPY', expected_pattern: 'FLY', importance: 10, notes: 'Tariff crash' },
 ];
 
 // Аналіз timeline через детектори
