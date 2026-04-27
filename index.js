@@ -1133,6 +1133,27 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+
+  // /edgar/check — manual trigger
+  if (req.url === '/edgar/check') {
+    res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+    res.end(JSON.stringify({ status: 'started', message: 'check running in background' }));
+    runDailyEdgarCheck().then(r => console.log('Manual EDGAR check:', JSON.stringify(r)));
+    return;
+  }
+
+  // /edgar/stats?ticker=X — статистика для тикера
+  if (req.url.startsWith('/edgar/stats')) {
+    const params = new URLSearchParams(req.url.split('?')[1]||'');
+    const ticker = params.get('ticker') || '';
+    if (!ticker) { res.writeHead(400); res.end('{}'); return; }
+    getEdgarStats(ticker).then(stats => {
+      res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+      res.end(JSON.stringify(stats || { error: 'not found' }));
+    });
+    return;
+  }
+
   // /ping endpoint — keepalive
   if (req.url === '/ping') {
     res.writeHead(200, { 'Content-Type': 'text/plain', 'Access-Control-Allow-Origin': '*' });
@@ -3315,6 +3336,156 @@ async function buildConvergence() {
     }
   };
 }
+
+
+// ════════════════════════════════════════
+// LIVE EDGAR MONITORING — daily insider activity
+// ════════════════════════════════════════
+
+// Кеш: ticker → 90-day baseline filings count
+const edgarBaseline = {};
+
+// Тягнемо filings за період і повертаємо стат
+async function getEdgarStats(ticker) {
+  const cik = await getCIKForTicker(ticker);
+  if (!cik) return null;
+
+  const sub = await secFetch('data.sec.gov', '/submissions/CIK' + cik + '.json');
+  if (!sub?.filings?.recent) return null;
+
+  const f = sub.filings.recent;
+  const now = Date.now();
+  const today = new Date().toISOString().slice(0,10);
+  const day30 = new Date(now - 30 * 86400000).toISOString().slice(0,10);
+  const day90 = new Date(now - 90 * 86400000).toISOString().slice(0,10);
+
+  let last30_form4 = 0, last30_8k = 0, last30_total = 0;
+  let prior60_form4 = 0, prior60_8k = 0, prior60_total = 0;
+  let last30_filings = [];
+
+  for (let i = 0; i < (f.form?.length||0); i++) {
+    const date = f.filingDate[i];
+    const form = f.form[i];
+
+    if (date >= day30 && date <= today) {
+      last30_total++;
+      if (form === '4') last30_form4++;
+      if (form === '8-K') last30_8k++;
+      last30_filings.push({ form, date, primaryDocument: f.primaryDocument[i] });
+    } else if (date >= day90 && date < day30) {
+      prior60_total++;
+      if (form === '4') prior60_form4++;
+      if (form === '8-K') prior60_8k++;
+    }
+  }
+
+  // Нормалізуємо за днями: prior60 за 60 днів, last30 за 30
+  const prior60_form4_perday = prior60_form4 / 60;
+  const last30_form4_perday = last30_form4 / 30;
+  const form4_ratio = prior60_form4_perday > 0 
+    ? last30_form4_perday / prior60_form4_perday 
+    : (last30_form4 > 0 ? 99 : 0);
+
+  return {
+    ticker, cik,
+    last30_form4, last30_8k, last30_total,
+    prior60_form4, prior60_8k, prior60_total,
+    form4_ratio: Math.round(form4_ratio * 100) / 100,
+    has_8k_burst: last30_8k >= 3,
+    last30_filings: last30_filings.slice(0, 10)
+  };
+}
+
+// Daily run — перевіряємо всі tracked entities з ticker
+async function runDailyEdgarCheck() {
+  console.log('Running daily EDGAR check...');
+
+  // Тягнемо tracked entities з ticker
+  const url = SUPABASE_URL + '/rest/v1/tracked_entities?related_ticker=not.is.null&order=importance.desc';
+  const tracked = await new Promise((resolve) => {
+    https.get(url, { headers: { 'apikey': SUPABASE_KEY, 'Authorization': 'Bearer ' + SUPABASE_KEY }}, (r) => {
+      let d = ''; r.on('data', c => d += c);
+      r.on('end', () => { try { resolve(JSON.parse(d)); } catch(e) { resolve([]); } });
+    }).on('error', () => resolve([]));
+  });
+
+  // Унікальні тикери (компанії, не валюти)
+  const tickers = [...new Set(tracked
+    .map(t => t.related_ticker)
+    .filter(t => t && !/^(USD|EUR|GBP|JPY|HUF|TRY|RUB|UAH|ARS|CNY|INR|BRL|ILS|KRW|CAD|AUD|CHF|GLD|USO|BTC|ETH|TON|BNB|SPY|QQQ|XLF|FXI|SOXX)/i.test(t))
+  )];
+
+  console.log('Checking', tickers.length, 'unique tickers');
+  let alerts = 0;
+
+  for (const ticker of tickers) {
+    const stats = await getEdgarStats(ticker);
+    if (!stats) continue;
+
+    // Перший раз — записуємо baseline і пропускаємо
+    if (!edgarBaseline[ticker]) {
+      edgarBaseline[ticker] = stats;
+      continue;
+    }
+
+    // Спрацьовує сигнал якщо:
+    // 1. form4_ratio >= 2x (insider burst)
+    // 2. last30_form4 >= 5 (мінімум активності щоб не на пустоті)
+    const isInsiderBurst = stats.form4_ratio >= 2 && stats.last30_form4 >= 5;
+    const isStrongSignal = stats.form4_ratio >= 3 && stats.has_8k_burst;
+
+    if (isInsiderBurst) {
+      // Знайти tracked entity для контексту
+      const entity = tracked.find(t => t.related_ticker === ticker);
+      const detail = ticker + ' insiders ' + stats.form4_ratio + 'x activity (last 30d: ' + stats.last30_form4 + ' form4 vs prior 60d avg) · 8-K count: ' + stats.last30_8k;
+
+      console.log('EDGAR alert:', ticker, '|', stats.form4_ratio + 'x', '| F4:', stats.last30_form4, '| 8K:', stats.last30_8k);
+
+      supabaseInsert('cross_signals', {
+        type: 'EDGAR+INSIDER',
+        title: ticker,
+        detail,
+        wiki_title: entity?.wiki_title || ticker,
+        crypto_symbol: ticker,
+        score: Math.min(100, stats.form4_ratio * 20)
+      }, 'title,type');
+
+      alerts++;
+
+      // Telegram для strong signals
+      if (isStrongSignal && TELEGRAM_TOKEN) {
+        sendTelegram(
+          '📈 <b>EDGAR INSIDER BURST: ' + ticker + '</b>\n\n' +
+          '🎯 ' + stats.form4_ratio + 'x activity vs 60-day baseline\n' +
+          '📋 Form 4 (insider): ' + stats.last30_form4 + ' (last 30d) vs ' + stats.prior60_form4 + ' (prior 60d)\n' +
+          '📰 8-K material: ' + stats.last30_8k + (stats.has_8k_burst ? ' ⚠️ BURST' : '') + '\n' +
+          (entity ? '\n👤 Linked: ' + entity.wiki_title + '\n📊 Type: ' + entity.entity_type : '') +
+          '\n\n🔗 https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=' + stats.cik
+        );
+      }
+    }
+
+    // Оновлюємо baseline
+    edgarBaseline[ticker] = stats;
+
+    // Rate limit — SEC обмежує 10 запитів/сек, тримаємо 1.5с щоб точно
+    await new Promise(r => setTimeout(r, 1500));
+  }
+
+  console.log('EDGAR daily check done. Alerts:', alerts);
+  return { tickers_checked: tickers.length, alerts };
+}
+
+// Розклад: запуск раз на 6 годин (4 рази на день)
+function scheduleEdgarCheck() {
+  // Перший раз через 5 хвилин (щоб всі компоненти стартували)
+  setTimeout(() => {
+    runDailyEdgarCheck();
+    setInterval(runDailyEdgarCheck, 6 * 3600000);
+  }, 5 * 60000);
+  console.log('EDGAR daily check scheduled');
+}
+scheduleEdgarCheck();
 
 connectGlobalUpstream();
 
