@@ -1054,6 +1054,28 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+
+  // /backtest/run — запустити backtest
+  if (req.url === '/backtest/run') {
+    res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+    res.end(JSON.stringify({ status: 'started', events: BACKTEST_EVENTS.length, message: 'check logs and /backtest/results' }));
+    runBacktest().then(r => console.log('Backtest done. Summary:', JSON.stringify(r.summary)));
+    return;
+  }
+
+  // /backtest/results — переглянути результати
+  if (req.url === '/backtest/results') {
+    const url = SUPABASE_URL + '/rest/v1/backtest_results?order=created_at.desc&limit=50';
+    https.get(url, { headers: { 'apikey': SUPABASE_KEY, 'Authorization': 'Bearer ' + SUPABASE_KEY } }, (r2) => {
+      let d = ''; r2.on('data', c => d += c);
+      r2.on('end', () => {
+        res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+        res.end(d);
+      });
+    }).on('error', () => { res.writeHead(500); res.end('{}'); });
+    return;
+  }
+
   // /ping endpoint — keepalive
   if (req.url === '/ping') {
     res.writeHead(200, { 'Content-Type': 'text/plain', 'Access-Control-Allow-Origin': '*' });
@@ -2430,6 +2452,199 @@ async function expandTrackedViaWikidata() {
 
   console.log('Expansion done — added:', added);
   return added;
+}
+
+
+// ════════════════════════════════════════
+// BACKTEST ENGINE — ретроспективна перевірка
+// ════════════════════════════════════════
+
+const BACKTEST_EVENTS = [
+  { date: '2025-03-28', title: 'CoreWeave', lang: 'en', type: 'IPO', ticker: 'CRWV', expected_pattern: 'BRANCH', importance: 9 },
+  { date: '2025-07-31', title: 'Figma', lang: 'en', type: 'IPO', ticker: 'FIG', expected_pattern: 'BRANCH', importance: 9 },
+  { date: '2025-06-05', title: 'Circle Internet Group', lang: 'en', type: 'IPO', ticker: 'CRCL', expected_pattern: 'BRANCH', importance: 8 },
+  { date: '2024-04-04', title: 'Reddit', lang: 'en', type: 'IPO', ticker: 'RDDT', expected_pattern: 'BRANCH', importance: 8 },
+  { date: '2022-11-11', title: 'FTX', lang: 'en', type: 'CRISIS', ticker: 'BTC-USD', expected_pattern: 'FLY', importance: 10 },
+  { date: '2023-03-10', title: 'Silicon Valley Bank', lang: 'en', type: 'CRISIS', ticker: 'XLF', expected_pattern: 'FLY', importance: 10 },
+  { date: '2023-03-19', title: 'Credit Suisse', lang: 'en', type: 'CRISIS', ticker: 'UBS', expected_pattern: 'FLY', importance: 9 },
+  { date: '2024-07-19', title: 'CrowdStrike', lang: 'en', type: 'CRISIS', ticker: 'CRWD', expected_pattern: 'FLY', importance: 9 },
+  { date: '2025-01-27', title: 'DeepSeek', lang: 'en', type: 'EVENT', ticker: 'NVDA', expected_pattern: 'FLY', importance: 10 },
+  { date: '2023-11-17', title: 'Sam Altman', lang: 'en', type: 'CORPORATE', ticker: 'MSFT', expected_pattern: 'FLY', importance: 10 },
+  { date: '2024-08-23', title: 'Pavel Durov', lang: 'en', type: 'CRISIS', ticker: 'TON-USD', expected_pattern: 'FLY', importance: 9 },
+  { date: '2024-11-05', title: '2024 United States presidential election', lang: 'en', type: 'ELECTION', ticker: 'SPY', expected_pattern: 'FLY', importance: 10 },
+  { date: '2024-11-23', title: 'Javier Milei', lang: 'en', type: 'ELECTION', ticker: 'ARS', expected_pattern: 'BRANCH', importance: 8 },
+  { date: '2024-07-04', title: '2024 United Kingdom general election', lang: 'en', type: 'ELECTION', ticker: 'GBP', expected_pattern: 'BRANCH', importance: 8 },
+  { date: '2022-09-08', title: 'Elizabeth II', lang: 'en', type: 'DEATH', ticker: 'GBP', expected_pattern: 'FLY', importance: 10 },
+  { date: '2025-04-21', title: 'Pope Francis', lang: 'en', type: 'DEATH', ticker: null, expected_pattern: 'FLY', importance: 10 },
+  { date: '2022-02-24', title: '2022 Russian invasion of Ukraine', lang: 'en', type: 'GEOPOLITICAL', ticker: 'RUB', expected_pattern: 'FLY', importance: 10 },
+  { date: '2023-10-07', title: 'October 7 attacks', lang: 'en', type: 'GEOPOLITICAL', ticker: 'GLD', expected_pattern: 'FLY', importance: 10 },
+  { date: '2024-12-08', title: 'Fall of the Assad regime', lang: 'en', type: 'GEOPOLITICAL', ticker: 'USO', expected_pattern: 'FLY', importance: 9 },
+  { date: '2024-01-10', title: 'Bitcoin', lang: 'en', type: 'CRYPTO', ticker: 'BTC-USD', expected_pattern: 'BRANCH', importance: 10 },
+  { date: '2022-11-30', title: 'ChatGPT', lang: 'en', type: 'PRODUCT', ticker: 'MSFT', expected_pattern: 'FLY', importance: 10 },
+  { date: '2025-01-19', title: 'TikTok', lang: 'en', type: 'REGULATORY', ticker: 'META', expected_pattern: 'FLY', importance: 9 },
+];
+
+// Аналіз timeline через детектори
+function analyzeTimeline(timeline, allUsers, rareEditors) {
+  if (!timeline || !timeline.length) {
+    return { detected: false, lead_time: 0, confidence: 0, pattern: null, signals: [], reasoning: 'no timeline' };
+  }
+
+  const signals = [];
+  let firstSignalT = 0;
+  let detectedPattern = null;
+  let confidence = 0;
+
+  // Шукаємо найперший день з editors >= 2
+  const earlyMultiEditor = timeline.find(d => d.t < 0 && d.editors >= 2);
+  if (earlyMultiEditor) {
+    signals.push('multi_editor_at_T' + earlyMultiEditor.t);
+    if (earlyMultiEditor.t < firstSignalT) firstSignalT = earlyMultiEditor.t;
+  }
+
+  // Рідкісні редактори за T-30..T-1
+  const rareInPeriod = timeline.filter(d => d.t < 0 && d.rareUsers && d.rareUsers.length > 0);
+  if (rareInPeriod.length >= 2) {
+    signals.push('rare_editor_cluster');
+    const earliest = Math.min(...rareInPeriod.map(d => d.t));
+    if (earliest < firstSignalT) firstSignalT = earliest;
+  }
+
+  // Фінансові keywords в коментарях за T<0
+  const FIN_KW = ['ipo','funding','acquisition','merger','bankrupt','fraud','sec filing','s-1','listing','offering','chapter 11','liquidity','collapse','initial public','went public','arrested','indicted'];
+  const finDays = timeline.filter(d => d.t < 0 && d.comments && d.comments.some(c => 
+    FIN_KW.some(kw => (c||'').toLowerCase().includes(kw))
+  ));
+  if (finDays.length > 0) {
+    signals.push('financial_keyword_at_T' + finDays[0].t);
+    if (finDays[0].t < firstSignalT) firstSignalT = finDays[0].t;
+  }
+
+  // STRONG signal в історії (T<0)
+  const strongDays = timeline.filter(d => d.t < 0 && d.signal === 'STRONG');
+  if (strongDays.length > 0) {
+    signals.push('strong_signal_at_T' + strongDays[0].t);
+    if (strongDays[0].t < firstSignalT) firstSignalT = strongDays[0].t;
+  }
+
+  // Burst — багато редакторів за день
+  const burstDays = timeline.filter(d => d.t < 0 && d.editors >= 5);
+  if (burstDays.length > 0) {
+    signals.push('editor_burst_at_T' + burstDays[0].t);
+  }
+
+  // Концентрований редактор з фін. керy
+  const concentrated = timeline.find(d => 
+    d.t < 0 && d.users && d.users.some(u => u.count >= 3 && !u.isIP) &&
+    d.comments && d.comments.some(c => FIN_KW.some(kw => (c||'').toLowerCase().includes(kw)))
+  );
+  if (concentrated) signals.push('concentrated_editor_with_finkw');
+
+  // Класифікація паттерну
+  if (signals.includes('rare_editor_cluster') || signals.includes('concentrated_editor_with_finkw') || 
+      signals.some(s => s.includes('financial_keyword'))) {
+    detectedPattern = 'BRANCH';
+    confidence = 0.7 + (signals.length * 0.05);
+  } else if (signals.includes('strong_signal_at_T0') || signals.some(s => s.includes('editor_burst'))) {
+    detectedPattern = 'FLY';
+    confidence = 0.6 + (signals.length * 0.05);
+  } else if (signals.length >= 2) {
+    detectedPattern = 'WEAK';
+    confidence = 0.4;
+  }
+
+  // Якщо firstSignalT = 0 і є multi_editor — теж сигнал
+  if (firstSignalT === 0 && earlyMultiEditor) firstSignalT = earlyMultiEditor.t;
+
+  const detected = !!detectedPattern && firstSignalT < 0;
+  
+  return {
+    detected,
+    lead_time: -firstSignalT, // позитивне число = за скільки днів до події
+    confidence: Math.min(confidence, 1),
+    pattern: detectedPattern,
+    signals,
+    reasoning: detected 
+      ? `${detectedPattern} pattern detected, first signal at T${firstSignalT}d`
+      : 'no clear preparatory signal'
+  };
+}
+
+async function fetchRetroData(title, eventDate, lang, days) {
+  return new Promise((resolve) => {
+    const url = 'https://resonance-dashboard-7a1u.vercel.app/api/retro?title='
+      + encodeURIComponent(title) + '&event=' + eventDate + '&lang=' + (lang||'en') + '&days=' + days;
+    https.get(url, { headers: { 'User-Agent': 'ResonanceBot/1.0' }}, (r) => {
+      let raw = ''; r.on('data', d => raw += d);
+      r.on('end', () => { try { resolve(JSON.parse(raw)); } catch(e) { resolve(null); } });
+    }).on('error', () => resolve(null));
+    setTimeout(() => resolve(null), 30000);
+  });
+}
+
+async function runBacktest() {
+  console.log('Running backtest on', BACKTEST_EVENTS.length, 'events...');
+  const results = [];
+
+  for (const event of BACKTEST_EVENTS) {
+    console.log('Backtest:', event.title, event.date);
+    const days = event.expected_pattern === 'BRANCH' ? 60 : 30;
+    const data = await fetchRetroData(event.title, event.date, event.lang, days);
+
+    if (!data || !data.found) {
+      results.push({ ...event, detected: false, reasoning: 'no data' });
+      console.log('  → no data');
+      continue;
+    }
+
+    const analysis = analyzeTimeline(data.timeline, data.allUsers, data.rareEditors);
+    
+    const result = {
+      event_date: event.date,
+      event_title: event.title,
+      event_type: event.type,
+      expected_pattern: event.expected_pattern,
+      detected: analysis.detected,
+      detected_pattern: analysis.pattern,
+      lead_time_days: analysis.lead_time,
+      confidence: analysis.confidence,
+      signals_found: analysis.signals,
+      rare_editors_found: (data.rareEditors||[]).slice(0,5).map(e => e.user),
+      total_revisions: data.total || 0,
+      reasoning: analysis.reasoning
+    };
+
+    results.push(result);
+
+    // Записуємо в Supabase
+    supabaseInsert('backtest_results', result);
+
+    console.log('  →', analysis.detected ? 'DETECTED' : 'MISSED', 
+      '|', analysis.pattern, '| lead:', analysis.lead_time + 'd',
+      '| conf:', analysis.confidence.toFixed(2),
+      '| signals:', analysis.signals.length);
+
+    // Rate limit
+    await new Promise(r => setTimeout(r, 2000));
+  }
+
+  // Підсумок
+  const detected = results.filter(r => r.detected);
+  const tpExpected = results.filter(r => r.detected && r.detected_pattern === r.expected_pattern);
+  console.log('\n═══ BACKTEST SUMMARY ═══');
+  console.log('Total events:', results.length);
+  console.log('Detected:', detected.length, '(' + Math.round(detected.length/results.length*100) + '%)');
+  console.log('Pattern match:', tpExpected.length, '(' + Math.round(tpExpected.length/results.length*100) + '%)');
+  
+  const branches = results.filter(r => r.expected_pattern === 'BRANCH');
+  const flies = results.filter(r => r.expected_pattern === 'FLY');
+  console.log('BRANCH events:', branches.filter(r => r.detected).length, '/', branches.length);
+  console.log('FLY events:', flies.filter(r => r.detected).length, '/', flies.length);
+  
+  const avgLead = detected.length ? (detected.reduce((s,r) => s + r.lead_time_days, 0) / detected.length).toFixed(1) : 0;
+  console.log('Avg lead time:', avgLead, 'days');
+  
+  return { results, summary: { total: results.length, detected: detected.length, avgLead } };
 }
 
 connectGlobalUpstream();
