@@ -1076,6 +1076,28 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+
+  // /github/backtest — запустити GitHub backtest
+  if (req.url === '/github/backtest') {
+    res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+    res.end(JSON.stringify({ status: 'started', events: GITHUB_BACKTEST_EVENTS.length }));
+    runGithubBacktest().then(r => console.log('GH Backtest done:', JSON.stringify(r.summary)));
+    return;
+  }
+
+  // /github/backtest/results — переглянути
+  if (req.url === '/github/backtest/results') {
+    const url = SUPABASE_URL + '/rest/v1/github_backtest?order=created_at.desc&limit=50';
+    https.get(url, { headers: { 'apikey': SUPABASE_KEY, 'Authorization': 'Bearer ' + SUPABASE_KEY } }, (r2) => {
+      let d = ''; r2.on('data', c => d += c);
+      r2.on('end', () => {
+        res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+        res.end(d);
+      });
+    }).on('error', () => { res.writeHead(500); res.end('{}'); });
+    return;
+  }
+
   // /ping endpoint — keepalive
   if (req.url === '/ping') {
     res.writeHead(200, { 'Content-Type': 'text/plain', 'Access-Control-Allow-Origin': '*' });
@@ -2703,6 +2725,248 @@ async function runBacktest() {
   console.log('Avg lead time:', avgLead, 'days');
   
   return { results, summary: { total: results.length, detected: detected.length, avgLead } };
+}
+
+
+// ════════════════════════════════════════
+// GITHUB BACKTEST — підтвердження концепції на іншій платформі
+// ════════════════════════════════════════
+
+// GitHub API helper з токеном (опціонально)
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN || '';
+
+async function ghApi(path) {
+  return new Promise((resolve) => {
+    const headers = { 'User-Agent': 'ResonanceBot/1.0', 'Accept': 'application/vnd.github.v3+json' };
+    if (GITHUB_TOKEN) headers['Authorization'] = 'token ' + GITHUB_TOKEN;
+    https.get({ hostname: 'api.github.com', path, headers }, (r) => {
+      let d = ''; r.on('data', c => d += c);
+      r.on('end', () => {
+        try {
+          const result = JSON.parse(d);
+          if (result.message?.includes('rate limit')) {
+            console.log('GitHub rate limited');
+            resolve(null);
+          } else resolve(result);
+        } catch(e) { resolve(null); }
+      });
+    }).on('error', () => resolve(null));
+    setTimeout(() => resolve(null), 15000);
+  });
+}
+
+// Тягнемо commits за період
+async function getCommitsInRange(owner, repo, since, until) {
+  const path = '/repos/' + owner + '/' + repo + '/commits?since=' + since + '&until=' + until + '&per_page=100';
+  const commits = await ghApi(path);
+  if (!Array.isArray(commits)) return [];
+  return commits.map(c => ({
+    sha: c.sha?.slice(0,7),
+    author: c.author?.login || c.commit?.author?.name || 'unknown',
+    date: c.commit?.author?.date,
+    message: (c.commit?.message||'').slice(0,150)
+  }));
+}
+
+// Тягнемо branches
+async function getBranches(owner, repo) {
+  const branches = await ghApi('/repos/' + owner + '/' + repo + '/branches?per_page=100');
+  if (!Array.isArray(branches)) return [];
+  return branches.map(b => b.name);
+}
+
+// Тягнемо releases
+async function getReleases(owner, repo) {
+  const releases = await ghApi('/repos/' + owner + '/' + repo + '/releases?per_page=30');
+  if (!Array.isArray(releases)) return [];
+  return releases.map(r => ({
+    tag: r.tag_name,
+    date: r.published_at,
+    name: (r.name||'').slice(0,80)
+  }));
+}
+
+// Аналіз GitHub timeline на наявність preparation pattern
+function analyzeGithubTimeline(commits, eventDate, branches, releases) {
+  if (!commits.length) {
+    return { detected: false, lead_time: 0, confidence: 0, signals: [], reasoning: 'no commits' };
+  }
+
+  const eventTs = new Date(eventDate).getTime();
+  const signals = [];
+  let firstSignalT = 0;
+
+  // Групуємо commits по днях
+  const byDay = {};
+  const authorsAll = new Set();
+  const authorCounts = {};
+  for (const c of commits) {
+    const day = c.date?.slice(0,10);
+    if (!day) continue;
+    const t = Math.round((new Date(day).getTime() - eventTs) / 86400000);
+    if (!byDay[day]) byDay[day] = { commits: 0, authors: new Set(), messages: [], t };
+    byDay[day].commits++;
+    byDay[day].authors.add(c.author);
+    byDay[day].messages.push(c.message);
+    authorsAll.add(c.author);
+    authorCounts[c.author] = (authorCounts[c.author]||0) + 1;
+  }
+
+  const days = Object.values(byDay).sort((a,b) => a.t - b.t);
+
+  // Сигнал 1: commit velocity sprint
+  const beforeDays = days.filter(d => d.t < 0 && d.t >= -30);
+  if (beforeDays.length >= 5) {
+    const avgCommits = beforeDays.reduce((s,d) => s + d.commits, 0) / beforeDays.length;
+    const burstDay = beforeDays.find(d => d.commits >= avgCommits * 3 && d.commits >= 5);
+    if (burstDay) {
+      signals.push('commit_burst_at_T' + burstDay.t);
+      if (burstDay.t < firstSignalT) firstSignalT = burstDay.t;
+    }
+  }
+
+  // Сигнал 2: rare contributors (1-2 commits загалом за період)
+  const rareAuthors = Object.entries(authorCounts).filter(([_,n]) => n <= 2);
+  const rareInPeriod = beforeDays.filter(d => 
+    [...d.authors].some(a => rareAuthors.find(([name]) => name === a))
+  );
+  if (rareInPeriod.length >= 2) {
+    signals.push('rare_contributor_cluster');
+    const earliest = Math.min(...rareInPeriod.map(d => d.t));
+    if (earliest < firstSignalT) firstSignalT = earliest;
+  }
+
+  // Сигнал 3: release/launch keywords в commit messages
+  const LAUNCH_KW = ['release','launch','prod','production','public','v1.0','v2.0','beta','rc1','rc2','final','official','announce'];
+  const launchCommits = beforeDays.filter(d =>
+    d.messages.some(m => LAUNCH_KW.some(kw => m.toLowerCase().includes(kw)))
+  );
+  if (launchCommits.length > 0) {
+    signals.push('launch_keyword_at_T' + launchCommits[0].t);
+    if (launchCommits[0].t < firstSignalT) firstSignalT = launchCommits[0].t;
+  }
+
+  // Сигнал 4: суспіцыйні гілки (release-*, prod-*, launch-*)
+  const suspBranches = (branches||[]).filter(b => /^(release|prod|launch|main-|v\d+|public|deploy)/i.test(b));
+  if (suspBranches.length > 0) {
+    signals.push('release_branches:' + suspBranches.length);
+  }
+
+  // Сигнал 5: release tags перед подією
+  const preReleases = (releases||[]).filter(r => {
+    if (!r.date) return false;
+    const t = Math.round((new Date(r.date).getTime() - eventTs) / 86400000);
+    return t < 0 && t >= -30;
+  });
+  if (preReleases.length > 0) {
+    signals.push('pre_event_releases:' + preReleases.length);
+    const earliestT = Math.min(...preReleases.map(r => 
+      Math.round((new Date(r.date).getTime() - eventTs) / 86400000)
+    ));
+    if (earliestT < firstSignalT) firstSignalT = earliestT;
+  }
+
+  let pattern = null;
+  let confidence = 0;
+  if (signals.length >= 3) {
+    pattern = 'BRANCH';
+    confidence = 0.7 + Math.min(signals.length * 0.05, 0.25);
+  } else if (signals.length >= 2) {
+    pattern = 'WEAK_BRANCH';
+    confidence = 0.5;
+  } else if (signals.length === 1) {
+    pattern = 'LOW';
+    confidence = 0.3;
+  }
+
+  const detected = !!pattern && firstSignalT < 0;
+
+  return {
+    detected,
+    lead_time: -firstSignalT,
+    confidence: Math.min(confidence, 1),
+    pattern,
+    signals,
+    total_commits: commits.length,
+    unique_authors: authorsAll.size,
+    rare_authors: rareAuthors.length,
+    reasoning: detected
+      ? `GitHub ${pattern} pattern, first signal at T${firstSignalT}d, ${signals.length} indicators`
+      : 'no clear preparatory pattern in commits'
+  };
+}
+
+// Список подій з відомими GitHub repos
+const GITHUB_BACKTEST_EVENTS = [
+  { date: '2025-01-27', title: 'DeepSeek launch', owner: 'deepseek-ai', repo: 'DeepSeek-V3', type: 'PRODUCT' },
+  { date: '2025-01-27', title: 'DeepSeek R1', owner: 'deepseek-ai', repo: 'DeepSeek-R1', type: 'PRODUCT' },
+  { date: '2024-04-18', title: 'Llama 3 release', owner: 'meta-llama', repo: 'llama3', type: 'PRODUCT' },
+  { date: '2024-09-25', title: 'Llama 3.2 release', owner: 'meta-llama', repo: 'llama-models', type: 'PRODUCT' },
+  { date: '2024-12-26', title: 'DeepSeek V3', owner: 'deepseek-ai', repo: 'DeepSeek-V3', type: 'PRODUCT' },
+  { date: '2024-07-23', title: 'Llama 3.1 release', owner: 'meta-llama', repo: 'llama-models', type: 'PRODUCT' },
+  { date: '2024-02-20', title: 'Gemma release', owner: 'google-deepmind', repo: 'gemma', type: 'PRODUCT' },
+  { date: '2024-12-09', title: 'Veo 2 release', owner: 'google-deepmind', repo: 'veo', type: 'PRODUCT' },
+  { date: '2025-03-12', title: 'Gemma 3 release', owner: 'google-deepmind', repo: 'gemma', type: 'PRODUCT' },
+  { date: '2024-09-17', title: 'Hezbollah pager attack', owner: 'apolocron', repo: 'hezbollah-pager-mystery', type: 'EVENT', notes: 'community analysis repos' },
+  { date: '2022-05-09', title: 'Terra collapse', owner: 'terra-money', repo: 'core', type: 'CRISIS' },
+  { date: '2022-11-11', title: 'FTX collapse', owner: 'ftxus', repo: 'serum-ts', type: 'CRISIS' },
+  { date: '2024-04-19', title: 'Bitcoin halving', owner: 'bitcoin', repo: 'bitcoin', type: 'CRYPTO' },
+  { date: '2024-01-10', title: 'BTC ETF approval', owner: 'bitcoin', repo: 'bitcoin', type: 'CRYPTO' },
+  { date: '2023-03-14', title: 'GPT-4 release', owner: 'openai', repo: 'openai-python', type: 'PRODUCT' },
+];
+
+async function runGithubBacktest() {
+  console.log('Running GitHub backtest on', GITHUB_BACKTEST_EVENTS.length, 'events...');
+  const results = [];
+
+  for (const event of GITHUB_BACKTEST_EVENTS) {
+    console.log('GitHub backtest:', event.title, event.owner + '/' + event.repo);
+
+    const eventDate = new Date(event.date);
+    const since = new Date(eventDate.getTime() - 60 * 86400000).toISOString();
+    const until = new Date(eventDate.getTime() + 7 * 86400000).toISOString();
+
+    const [commits, branches, releases] = await Promise.all([
+      getCommitsInRange(event.owner, event.repo, since, until),
+      getBranches(event.owner, event.repo),
+      getReleases(event.owner, event.repo)
+    ]);
+
+    const analysis = analyzeGithubTimeline(commits, event.date, branches, releases);
+
+    const result = {
+      event_date: event.date,
+      event_title: event.title,
+      event_type: event.type,
+      platform: 'GITHUB',
+      repo: event.owner + '/' + event.repo,
+      detected: analysis.detected,
+      detected_pattern: analysis.pattern,
+      lead_time_days: analysis.lead_time,
+      confidence: analysis.confidence,
+      signals_found: analysis.signals,
+      total_commits: analysis.total_commits || 0,
+      unique_authors: analysis.unique_authors || 0,
+      rare_authors: analysis.rare_authors || 0,
+      reasoning: analysis.reasoning
+    };
+
+    results.push(result);
+
+    supabaseInsert('github_backtest', result);
+
+    console.log('  →', analysis.detected ? 'DETECTED' : 'MISSED',
+      '|', analysis.pattern, '| lead:', analysis.lead_time + 'd',
+      '| commits:', commits.length, '| signals:', analysis.signals.length);
+
+    await new Promise(r => setTimeout(r, 2500)); // GitHub rate limit
+  }
+
+  const detected = results.filter(r => r.detected);
+  console.log('\n═══ GITHUB BACKTEST SUMMARY ═══');
+  console.log('Total:', results.length);
+  console.log('Detected:', detected.length, '(' + Math.round(detected.length/results.length*100) + '%)');
+  return { results, summary: { total: results.length, detected: detected.length } };
 }
 
 connectGlobalUpstream();
