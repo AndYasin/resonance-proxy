@@ -97,11 +97,24 @@ async function getPolyMarkets() {
 }
 
 function fetchPolymarketSignal(title, editors) {
-  const words = title.toLowerCase().split(/\s+/).filter(w => w.length > 3);
+  // Стоп-слова — занадто загальні
+  const STOPWORDS = new Set(['will','with','from','that','this','have','their','they','what','when','where','about','after','before','election','party','company','president','minister','death','died','football','draft','league','match','series','final','finals','season','team','player','game','games','news','update','first','last','part','time','year','years','national','international','world','american','will','race','bowl','tournament','championship','prize','award','medal']);
+  // Виключаємо роки
+  const words = title.toLowerCase()
+    .replace(/[^\w\s]/g,' ')
+    .split(/\s+/)
+    .filter(w => w.length > 3 && !STOPWORDS.has(w) && !/^\d{4}$/.test(w));
+
+  if (!words.length) return;
+
   getPolyMarkets().then(markets => {
     const matches = markets.filter(m => {
       const q = (m.question||'').toLowerCase();
-      return words.some(w => q.includes(w));
+      // Вимагаємо 2+ матчів слів АБО матч слова з 6+ символами (унікальніше)
+      const matchedWords = words.filter(w => q.includes(w));
+      if (matchedWords.length >= 2) return true;
+      if (matchedWords.length === 1 && matchedWords[0].length >= 7) return true;
+      return false;
     });
     if (!matches.length) return;
     const top = matches[0];
@@ -117,7 +130,8 @@ function fetchPolymarketSignal(title, editors) {
       crypto_symbol: null,
       score: yesProb * Math.log(vol+1)
     });
-    if (editors >= 2 && vol > 100 && TELEGRAM_TOKEN) {
+    // Telegram тільки якщо подія справді актуальна (yesProb 5-95%, є взаємодія)
+    if (editors >= 2 && vol > 100 && yesProb >= 5 && yesProb <= 95 && TELEGRAM_TOKEN) {
       const emoji = yesProb > 70 ? '🟢' : yesProb > 40 ? '🟡' : '🔴';
       sendTelegram(
         emoji + ' <b>Polymarket сигнал: ' + title + '</b>\n\n' +
@@ -328,7 +342,7 @@ async function getWikiInfo(title, lang) {
           else if (/businessperson|ceo|billionaire|executive|entrepreneur/.test(cats))    type = '💼 БІЗНЕС';
           else if (/sportsperson|athlete|footballer|tennis|basketball|olympic/.test(cats)) type = '⚽ СПОРТ';
           else if (/actor|musician|singer|director|comedian|rapper/.test(cats))           type = '🎭 КУЛЬТУРА';
-          else if (/military|general|admiral|colonel|commander|armed forces/.test(cats))  type = '🎖 ВІЙСЬКОВІ';
+          else if (/military officer|admiral|colonel|brigadier|armed forces|navy officer|army officer/.test(cats))  type = '🎖 ВІЙСЬКОВІ';
           else if (/scientist|professor|physicist|biologist|chemist/.test(cats))          type = '🔬 НАУКА';
           else if (/strait|canal|waterway|conflict|crisis|war|military operation/.test(cats)) type = '🌏 ГЕОПОЛІТИКА';
           else if (/football club|association football|league|championship/.test(cats))   type = '🏆 ФУТБОЛ';
@@ -435,6 +449,9 @@ function looksLikeBot(user, isBot) {
   // IP addresses
   if (/^\d+\.\d+\.\d+\.\d+$/.test(user)) return true;
   if (/^[0-9a-f:]+:[0-9a-f:]+$/i.test(user)) return true; // IPv6
+  // Bot-like usernames
+  if (/bot\d*$|BOT\d*$|Bot\d*$/i.test(user)) return true;
+  if (/^[A-Z]\w*Bot/.test(user)) return true;
   return false;
 }
 
