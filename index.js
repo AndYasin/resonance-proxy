@@ -1134,6 +1134,19 @@ const server = http.createServer((req, res) => {
   }
 
 
+  // /edgar/signals — переглянути EDGAR+INSIDER cross signals
+  if (req.url === '/edgar/signals') {
+    const url = SUPABASE_URL + '/rest/v1/cross_signals?type=eq.EDGAR%2BINSIDER&order=created_at.desc&limit=30';
+    https.get(url, { headers: { 'apikey': SUPABASE_KEY, 'Authorization': 'Bearer ' + SUPABASE_KEY }}, (r2) => {
+      let d = ''; r2.on('data', c => d += c);
+      r2.on('end', () => {
+        res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+        res.end(d);
+      });
+    }).on('error', () => { res.writeHead(500); res.end('{}'); });
+    return;
+  }
+
   // /edgar/check — manual trigger
   if (req.url === '/edgar/check') {
     res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
