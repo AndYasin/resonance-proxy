@@ -1120,6 +1120,19 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+
+  // /convergence — крос-платформа аналіз
+  if (req.url === '/convergence') {
+    buildConvergence().then(result => {
+      res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+      res.end(JSON.stringify(result, null, 2));
+    }).catch(e => {
+      res.writeHead(500, {'Content-Type':'application/json'});
+      res.end(JSON.stringify({error: e.message}));
+    });
+    return;
+  }
+
   // /ping endpoint — keepalive
   if (req.url === '/ping') {
     res.writeHead(200, { 'Content-Type': 'text/plain', 'Access-Control-Allow-Origin': '*' });
@@ -3197,6 +3210,110 @@ async function runEdgarBacktest() {
   console.log('Total:', results.length);
   console.log('Detected:', detected.length, '(' + Math.round(detected.length/results.length*100) + '%)');
   return { results };
+}
+
+
+// ════════════════════════════════════════
+// CONVERGENCE ANALYSIS — крос-платформ
+// ════════════════════════════════════════
+
+async function fetchTable(table) {
+  return new Promise((resolve) => {
+    https.get(SUPABASE_URL + '/rest/v1/' + table + '?limit=200', {
+      headers: { 'apikey': SUPABASE_KEY, 'Authorization': 'Bearer ' + SUPABASE_KEY }
+    }, (r) => {
+      let d = ''; r.on('data', c => d += c);
+      r.on('end', () => { try { resolve(JSON.parse(d)); } catch(e) { resolve([]); } });
+    }).on('error', () => resolve([]));
+  });
+}
+
+async function buildConvergence() {
+  const wiki = await fetchTable('backtest_results');
+  const github = await fetchTable('github_backtest');
+  const edgar = await fetchTable('edgar_backtest');
+
+  const eventsMap = {};
+
+  // Нормалізатор назв — забираємо суфікси
+  const normalize = s => s.toLowerCase()
+    .replace(/\s+(ipo|earnings|deal|bankruptcy|collapse|outage|takeover|going concern|whistleblower|door blowout|ceo killed|ai earnings beat|launch|release|approval|halving)\s*$/i, '')
+    .replace(/^\d{4}\s+/, '')
+    .trim();
+
+  for (const w of wiki) {
+    const key = normalize(w.event_title);
+    if (!eventsMap[key]) eventsMap[key] = { title: w.event_title, date: w.event_date, type: w.event_type };
+    eventsMap[key].wiki = {
+      detected: w.detected, pattern: w.detected_pattern,
+      lead: w.lead_time_days, conf: w.confidence,
+      signals: (w.signals_found||[]).length
+    };
+  }
+
+  for (const g of github) {
+    const key = normalize(g.event_title);
+    if (!eventsMap[key]) eventsMap[key] = { title: g.event_title, date: g.event_date, type: g.event_type };
+    eventsMap[key].github = {
+      detected: g.detected, pattern: g.detected_pattern,
+      lead: g.lead_time_days, conf: g.confidence,
+      signals: (g.signals_found||[]).length
+    };
+  }
+
+  for (const e of edgar) {
+    const key = normalize(e.event_title);
+    if (!eventsMap[key]) eventsMap[key] = { title: e.event_title, date: e.event_date, type: e.event_type };
+    eventsMap[key].edgar = {
+      detected: e.detected, pattern: e.detected_pattern,
+      lead: e.lead_time_days, conf: e.confidence,
+      signals: (e.signals_found||[]).length,
+      ticker: e.ticker
+    };
+  }
+
+  const conv = [];
+  for (const [key, ev] of Object.entries(eventsMap)) {
+    const sources = [];
+    const attempted = [];
+    if (ev.wiki) attempted.push('WIKI');
+    if (ev.github) attempted.push('GITHUB');
+    if (ev.edgar) attempted.push('EDGAR');
+    if (ev.wiki?.detected) sources.push('WIKI');
+    if (ev.github?.detected) sources.push('GITHUB');
+    if (ev.edgar?.detected) sources.push('EDGAR');
+
+    const confs = [ev.wiki?.conf, ev.github?.conf, ev.edgar?.conf].filter(c => c !== undefined);
+    const avgConf = confs.length ? confs.reduce((s,c)=>s+c,0)/confs.length : 0;
+
+    conv.push({
+      title: ev.title, date: ev.date, type: ev.type,
+      detected_in: sources, attempted_in: attempted,
+      score: sources.length,
+      avg_conf: avgConf,
+      wiki_lead: ev.wiki?.lead || null,
+      github_lead: ev.github?.lead || null,
+      edgar_lead: ev.edgar?.lead || null,
+      max_lead: Math.max(ev.wiki?.lead||0, ev.github?.lead||0, ev.edgar?.lead||0),
+      ticker: ev.edgar?.ticker || null
+    });
+  }
+
+  conv.sort((a,b) => b.score - a.score || b.avg_conf - a.avg_conf);
+
+  return {
+    total_events: conv.length,
+    triple: conv.filter(c => c.score === 3),
+    double: conv.filter(c => c.score === 2),
+    single: conv.filter(c => c.score === 1),
+    none: conv.filter(c => c.score === 0).map(c => c.title),
+    summary: {
+      triple_count: conv.filter(c => c.score === 3).length,
+      double_count: conv.filter(c => c.score === 2).length,
+      single_count: conv.filter(c => c.score === 1).length,
+      none_count: conv.filter(c => c.score === 0).length
+    }
+  };
 }
 
 connectGlobalUpstream();
