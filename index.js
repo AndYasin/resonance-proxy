@@ -1098,6 +1098,28 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+
+  // /edgar/backtest — запустити EDGAR backtest
+  if (req.url === '/edgar/backtest') {
+    res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+    res.end(JSON.stringify({ status: 'started', events: EDGAR_BACKTEST_EVENTS.length }));
+    runEdgarBacktest().then(r => console.log('EDGAR backtest done'));
+    return;
+  }
+
+  // /edgar/backtest/results
+  if (req.url === '/edgar/backtest/results') {
+    const url = SUPABASE_URL + '/rest/v1/edgar_backtest?order=created_at.desc&limit=50';
+    https.get(url, { headers: { 'apikey': SUPABASE_KEY, 'Authorization': 'Bearer ' + SUPABASE_KEY } }, (r2) => {
+      let d = ''; r2.on('data', c => d += c);
+      r2.on('end', () => {
+        res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+        res.end(d);
+      });
+    }).on('error', () => { res.writeHead(500); res.end('{}'); });
+    return;
+  }
+
   // /ping endpoint — keepalive
   if (req.url === '/ping') {
     res.writeHead(200, { 'Content-Type': 'text/plain', 'Access-Control-Allow-Origin': '*' });
@@ -2967,6 +2989,214 @@ async function runGithubBacktest() {
   console.log('Total:', results.length);
   console.log('Detected:', detected.length, '(' + Math.round(detected.length/results.length*100) + '%)');
   return { results, summary: { total: results.length, detected: detected.length } };
+}
+
+
+// ════════════════════════════════════════
+// SEC EDGAR BACKTEST
+// ════════════════════════════════════════
+
+const SEC_HEADERS = { 'User-Agent': 'ResonanceBot abobiy@gmail.com' };
+
+async function secFetch(host, path) {
+  return new Promise((resolve) => {
+    https.get({ hostname: host, path, headers: SEC_HEADERS }, (r) => {
+      let d = ''; r.on('data', c => d += c);
+      r.on('end', () => { try { resolve(JSON.parse(d)); } catch(e) { resolve(null); } });
+    }).on('error', () => resolve(null));
+    setTimeout(() => resolve(null), 15000);
+  });
+}
+
+let secTickerCache = null;
+async function getCIKForTicker(ticker) {
+  if (!secTickerCache) {
+    secTickerCache = await secFetch('www.sec.gov', '/files/company_tickers.json');
+  }
+  if (!secTickerCache) return null;
+  const found = Object.values(secTickerCache).find(t => t.ticker === ticker.toUpperCase());
+  return found ? String(found.cik_str).padStart(10, '0') : null;
+}
+
+// Тягнемо filings компанії за період
+async function getFilingsInRange(cik, startDate, endDate) {
+  const sub = await secFetch('data.sec.gov', '/submissions/CIK' + cik + '.json');
+  if (!sub?.filings?.recent) return [];
+  const f = sub.filings.recent;
+  const results = [];
+  for (let i = 0; i < (f.form?.length || 0); i++) {
+    const filingDate = f.filingDate[i];
+    if (filingDate < startDate || filingDate > endDate) continue;
+    results.push({
+      form: f.form[i],
+      filingDate,
+      accessionNumber: f.accessionNumber[i],
+      primaryDocument: f.primaryDocument[i],
+      reportDate: f.reportDate[i] || null
+    });
+  }
+  return results;
+}
+
+// Аналіз filings перед подією
+function analyzeEdgarFilings(filings, eventDate) {
+  const eventTs = new Date(eventDate).getTime();
+  const signals = [];
+  let firstSignalT = 0;
+
+  // Перетворюємо в days-from-event
+  const filingsT = filings.map(f => {
+    const t = Math.round((new Date(f.filingDate).getTime() - eventTs) / 86400000);
+    return { ...f, t };
+  }).filter(f => f.t < 0 && f.t >= -90); // 90 днів до події
+
+  // Сигнал 1: Form 4 (insider trades) — concentrated activity
+  const form4s = filingsT.filter(f => f.form === '4');
+  if (form4s.length >= 3) {
+    signals.push('insider_activity:' + form4s.length);
+    const earliest = Math.min(...form4s.map(f => f.t));
+    if (earliest < firstSignalT) firstSignalT = earliest;
+  }
+
+  // Сигнал 2: 8-K filings (material events) — burst
+  const eightKs = filingsT.filter(f => f.form === '8-K');
+  if (eightKs.length >= 2) {
+    signals.push('8k_burst:' + eightKs.length);
+    const earliest = Math.min(...eightKs.map(f => f.t));
+    if (earliest < firstSignalT) firstSignalT = earliest;
+  }
+
+  // Сигнал 3: S-1 / S-1/A (IPO docs)
+  const s1s = filingsT.filter(f => /^S-1/.test(f.form));
+  if (s1s.length > 0) {
+    signals.push('s1_filings:' + s1s.length);
+    const earliest = Math.min(...s1s.map(f => f.t));
+    if (earliest < firstSignalT) firstSignalT = earliest;
+  }
+
+  // Сигнал 4: SC 13D/G (large stake announcements)
+  const stakeFilings = filingsT.filter(f => /^SC 13/.test(f.form));
+  if (stakeFilings.length > 0) {
+    signals.push('large_stake:' + stakeFilings.length);
+  }
+
+  // Сигнал 5: 425 (M&A communications), DEFM14A (merger proxy)
+  const maFilings = filingsT.filter(f => /^(425|DEFM14A|S-4)/.test(f.form));
+  if (maFilings.length > 0) {
+    signals.push('ma_communications:' + maFilings.length);
+  }
+
+  // Сигнал 6: Прискорення filings — більше за останні 30 днів ніж попередні 60
+  const last30 = filingsT.filter(f => f.t >= -30).length;
+  const prior60 = filingsT.filter(f => f.t < -30 && f.t >= -90).length;
+  if (last30 > prior60 && last30 >= 3) {
+    signals.push('filing_acceleration:' + last30 + 'vs' + prior60);
+  }
+
+  let pattern = null;
+  let confidence = 0;
+  if (signals.length >= 3) {
+    pattern = 'BRANCH';
+    confidence = 0.75 + Math.min(signals.length * 0.05, 0.25);
+  } else if (signals.length >= 2) {
+    pattern = 'WEAK_BRANCH';
+    confidence = 0.5;
+  } else if (signals.length === 1) {
+    pattern = 'LOW';
+    confidence = 0.3;
+  }
+
+  return {
+    detected: !!pattern && firstSignalT < 0,
+    lead_time: -firstSignalT,
+    confidence: Math.min(confidence, 1),
+    pattern,
+    signals,
+    total_filings: filingsT.length,
+    reasoning: pattern ? `${pattern}: ${signals.length} indicator(s), first at T${firstSignalT}d` : 'no preparation pattern'
+  };
+}
+
+// Список подій з відомими тикерами
+const EDGAR_BACKTEST_EVENTS = [
+  { date: '2025-03-28', title: 'CoreWeave IPO', ticker: 'CRWV', type: 'IPO' },
+  { date: '2025-07-31', title: 'Figma IPO', ticker: 'FIG', type: 'IPO' },
+  { date: '2025-06-05', title: 'Circle IPO', ticker: 'CRCL', type: 'IPO' },
+  { date: '2024-04-04', title: 'Reddit IPO', ticker: 'RDDT', type: 'IPO' },
+  { date: '2023-03-10', title: 'SVB collapse', ticker: 'SIVBQ', type: 'CRISIS' },
+  { date: '2024-07-19', title: 'CrowdStrike outage', ticker: 'CRWD', type: 'CRISIS' },
+  { date: '2024-12-04', title: 'UnitedHealth CEO killed', ticker: 'UNH', type: 'CRISIS' },
+  { date: '2024-01-05', title: 'Boeing door blowout', ticker: 'BA', type: 'CRISIS' },
+  { date: '2023-05-24', title: 'Nvidia AI earnings beat', ticker: 'NVDA', type: 'EARNINGS' },
+  { date: '2024-02-21', title: 'Nvidia earnings', ticker: 'NVDA', type: 'EARNINGS' },
+  { date: '2024-08-29', title: 'Nvidia earnings', ticker: 'NVDA', type: 'EARNINGS' },
+  { date: '2024-02-22', title: 'Eli Lilly earnings', ticker: 'LLY', type: 'EARNINGS' },
+  { date: '2024-02-21', title: 'Pfizer earnings', ticker: 'PFE', type: 'EARNINGS' },
+  { date: '2023-11-06', title: 'WeWork bankruptcy', ticker: 'WE', type: 'CRISIS' },
+  { date: '2024-01-26', title: 'HPE-Juniper deal', ticker: 'HPE', type: 'MA' },
+  { date: '2023-10-13', title: 'Cisco-Splunk deal', ticker: 'CSCO', type: 'MA' },
+  { date: '2022-10-27', title: 'Twitter takeover', ticker: 'TWTR', type: 'MA' },
+  { date: '2023-08-21', title: 'WeWork going concern', ticker: 'WE', type: 'CRISIS' },
+  { date: '2024-04-22', title: 'Boeing whistleblower', ticker: 'BA', type: 'CRISIS' },
+  { date: '2025-01-30', title: 'Microsoft earnings', ticker: 'MSFT', type: 'EARNINGS' }
+];
+
+async function runEdgarBacktest() {
+  console.log('Running EDGAR backtest on', EDGAR_BACKTEST_EVENTS.length, 'events...');
+  const results = [];
+
+  for (const event of EDGAR_BACKTEST_EVENTS) {
+    console.log('EDGAR backtest:', event.title, '|', event.ticker);
+
+    const cik = await getCIKForTicker(event.ticker);
+    if (!cik) {
+      console.log('  → CIK not found for', event.ticker);
+      results.push({
+        event_date: event.date, event_title: event.title, event_type: event.type,
+        platform: 'EDGAR', ticker: event.ticker, detected: false,
+        reasoning: 'CIK not found (delisted or never public)'
+      });
+      continue;
+    }
+
+    const eventDate = new Date(event.date);
+    const startDate = new Date(eventDate.getTime() - 90 * 86400000).toISOString().slice(0,10);
+    const endDate = event.date;
+
+    const filings = await getFilingsInRange(cik, startDate, endDate);
+    const analysis = analyzeEdgarFilings(filings, event.date);
+
+    const result = {
+      event_date: event.date,
+      event_title: event.title,
+      event_type: event.type,
+      platform: 'EDGAR',
+      ticker: event.ticker,
+      cik,
+      detected: analysis.detected,
+      detected_pattern: analysis.pattern,
+      lead_time_days: analysis.lead_time,
+      confidence: analysis.confidence,
+      signals_found: analysis.signals,
+      total_filings: analysis.total_filings,
+      reasoning: analysis.reasoning
+    };
+
+    results.push(result);
+    supabaseInsert('edgar_backtest', result);
+
+    console.log('  →', analysis.detected ? 'DETECTED' : 'MISSED',
+      '|', analysis.pattern, '| lead:', analysis.lead_time + 'd',
+      '| filings:', analysis.total_filings, '| signals:', analysis.signals.length);
+
+    await new Promise(r => setTimeout(r, 1500)); // SEC rate limit ~10/sec
+  }
+
+  const detected = results.filter(r => r.detected);
+  console.log('\n═══ EDGAR BACKTEST SUMMARY ═══');
+  console.log('Total:', results.length);
+  console.log('Detected:', detected.length, '(' + Math.round(detected.length/results.length*100) + '%)');
+  return { results };
 }
 
 connectGlobalUpstream();
