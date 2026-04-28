@@ -1186,13 +1186,39 @@ const server = http.createServer((req, res) => {
       }
     }, (r3) => {
       let d = ''; r3.on('data', c => d += c);
-      r3.on('end', () => {
+      r3.on('end', async () => {
+        // Якщо approved або watching — фіксуємо entry price
+        if (decision === 'approve' || decision === 'watch') {
+          // Отримаємо ticker з картки
+          const cardUrl = SUPABASE_URL + '/rest/v1/action_cards?id=eq.' + id + '&select=signal_source';
+          https.get(cardUrl, { headers: { 'apikey': SUPABASE_KEY, 'Authorization': 'Bearer ' + SUPABASE_KEY }}, async (cr) => {
+            let cd = ''; cr.on('data', c => cd += c);
+            cr.on('end', async () => {
+              try {
+                const cardArr = JSON.parse(cd);
+                const ticker = cardArr?.[0]?.signal_source;
+                if (ticker) {
+                  const entry = await captureCardEntry(id, ticker);
+                  console.log('Card #' + id + ' entry captured at $' + entry);
+                }
+              } catch(e) {}
+            });
+          });
+        }
         res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
         res.end(JSON.stringify({ id, decision, status: newStatus }));
       });
     });
     req2.on('error', () => { res.writeHead(500); res.end('{}'); });
     req2.write(body); req2.end();
+    return;
+  }
+
+  // /outcomes/check — manual outcome check
+  if (req.url === '/outcomes/check') {
+    res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+    res.end(JSON.stringify({ status: 'started' }));
+    runOutcomeCheck().then(r => console.log('Manual outcome:', JSON.stringify(r)));
     return;
   }
 
@@ -3926,6 +3952,214 @@ async function runDailyEdgarCheck() {
   return { tickers_checked: tickers.length, alerts };
 }
 
+
+// ════════════════════════════════════════
+// OUTCOME TRACKER — перевірка карток
+// ════════════════════════════════════════
+
+// При approve — фіксуємо entry price
+async function captureCardEntry(cardId, ticker) {
+  if (!ticker) return null;
+  const priceData = await getYahooPrice(ticker);
+  if (!priceData?.price) return null;
+  
+  const body = JSON.stringify({
+    entry_price: priceData.price,
+    entry_date: new Date().toISOString()
+  });
+  
+  await new Promise((resolve) => {
+    const req = https.request({
+      hostname: 'ovedzfpptsnxzxioyzkr.supabase.co',
+      path: '/rest/v1/action_cards?id=eq.' + cardId,
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+        'apikey': SUPABASE_KEY,
+        'Authorization': 'Bearer ' + SUPABASE_KEY,
+        'Prefer': 'return=minimal'
+      }
+    }, (r) => { r.on('data', () => {}); r.on('end', resolve); });
+    req.on('error', resolve);
+    req.write(body); req.end();
+  });
+  
+  return priceData.price;
+}
+
+// Парсимо target/stop з тексту в число (USD або %)
+function parseTargetValue(text, entryPrice, direction) {
+  if (!text || !entryPrice) return null;
+  const cleaned = text.toString().replace(/[$,]/g,'').trim();
+  
+  // Пряма ціна: "920" або "$920"
+  const direct = cleaned.match(/^-?\d+(\.\d+)?$/);
+  if (direct) {
+    const val = parseFloat(cleaned);
+    // Якщо < 50% від entry — то це може бути %
+    if (Math.abs(val) < entryPrice * 0.3 && Math.abs(val) < 100) {
+      // Це %
+      return entryPrice * (1 + val/100);
+    }
+    return val;
+  }
+  
+  // Відсоток: "-5%" або "+10%"
+  const pct = cleaned.match(/(-?\d+(\.\d+)?)\s*%/);
+  if (pct) {
+    return entryPrice * (1 + parseFloat(pct[1])/100);
+  }
+  
+  return null;
+}
+
+// Перевіряємо одну картку
+async function checkCardOutcome(card) {
+  if (!card.entry_price || !card.signal_source) return null;
+  
+  const ticker = card.signal_source;
+  const priceData = await getYahooPrice(ticker);
+  if (!priceData?.price) return null;
+  
+  const currentPrice = priceData.price;
+  const entryPrice = parseFloat(card.entry_price);
+  const isShort = card.direction === 'SHORT';
+  
+  // Розраховуємо P&L
+  const priceMove = currentPrice - entryPrice;
+  const pctMove = (priceMove / entryPrice) * 100;
+  const pnl = isShort ? -pctMove : pctMove;
+  
+  // Парсимо target і stop
+  const targetPrice = parseTargetValue(card.target, entryPrice, card.direction);
+  const stopPrice = parseTargetValue(card.stop_loss, entryPrice, card.direction);
+  
+  // Перевіряємо чи досягли
+  let outcome = 'STILL_OPEN';
+  let outcomeNotes = '';
+  
+  if (targetPrice !== null) {
+    const reachedTarget = isShort ? currentPrice <= targetPrice : currentPrice >= targetPrice;
+    if (reachedTarget) {
+      outcome = 'WIN';
+      outcomeNotes = 'Target ' + targetPrice.toFixed(2) + ' reached at ' + currentPrice.toFixed(2);
+    }
+  }
+  
+  if (stopPrice !== null && outcome === 'STILL_OPEN') {
+    const hitStop = isShort ? currentPrice >= stopPrice : currentPrice <= stopPrice;
+    if (hitStop) {
+      outcome = 'LOSS';
+      outcomeNotes = 'Stop ' + stopPrice.toFixed(2) + ' hit at ' + currentPrice.toFixed(2);
+    }
+  }
+  
+  // Перевіряємо чи timeframe закінчився
+  const entryDate = new Date(card.entry_date || card.decision_at);
+  const tfDays = parseInt(card.timeframe) || 30;
+  const expiresAt = new Date(entryDate.getTime() + tfDays * 86400000);
+  const isExpired = Date.now() > expiresAt.getTime();
+  
+  if (isExpired && outcome === 'STILL_OPEN') {
+    outcome = pnl > 0 ? 'WIN_PARTIAL' : pnl < -0.5 ? 'LOSS_PARTIAL' : 'NEUTRAL';
+    outcomeNotes = 'Timeframe expired. P&L: ' + pnl.toFixed(2) + '%';
+  }
+  
+  return {
+    card_id: card.id,
+    ticker,
+    entry_price: entryPrice,
+    current_price: currentPrice,
+    pnl_pct: Math.round(pnl * 100) / 100,
+    target_price: targetPrice,
+    stop_price: stopPrice,
+    outcome,
+    outcome_notes: outcomeNotes,
+    is_final: outcome !== 'STILL_OPEN'
+  };
+}
+
+// Daily check всіх approved/watching карток
+async function runOutcomeCheck() {
+  console.log('Running outcome check on active cards...');
+  
+  const url = SUPABASE_URL + '/rest/v1/action_cards?status=in.(approved,watching)&outcome=is.null&limit=50';
+  const cards = await new Promise((resolve) => {
+    https.get(url, { headers: { 'apikey': SUPABASE_KEY, 'Authorization': 'Bearer ' + SUPABASE_KEY }}, (r) => {
+      let d = ''; r.on('data', c => d += c);
+      r.on('end', () => { try { resolve(JSON.parse(d)); } catch(e) { resolve([]); } });
+    }).on('error', () => resolve([]));
+  });
+  
+  console.log('Active cards to check:', cards.length);
+  let updates = 0;
+  
+  for (const card of cards) {
+    const result = await checkCardOutcome(card);
+    if (!result) continue;
+    
+    // Якщо це фінальний outcome — записуємо
+    if (result.is_final) {
+      const body = JSON.stringify({
+        outcome: result.outcome,
+        outcome_notes: result.outcome_notes + ' (current: $' + result.current_price + ', P&L: ' + result.pnl_pct + '%)',
+        outcome_checked_at: new Date().toISOString()
+      });
+      
+      await new Promise((resolve) => {
+        const req = https.request({
+          hostname: 'ovedzfpptsnxzxioyzkr.supabase.co',
+          path: '/rest/v1/action_cards?id=eq.' + card.id,
+          method: 'PATCH',
+          headers: {
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(body),
+            'apikey': SUPABASE_KEY,
+            'Authorization': 'Bearer ' + SUPABASE_KEY,
+            'Prefer': 'return=minimal'
+          }
+        }, (r) => { r.on('data', () => {}); r.on('end', resolve); });
+        req.on('error', resolve);
+        req.write(body); req.end();
+      });
+      
+      console.log('Card #' + card.id + ' (' + card.signal_source + ') → ' + result.outcome + ' | P&L: ' + result.pnl_pct + '%');
+      updates++;
+      
+      if (TELEGRAM_TOKEN && (result.outcome === 'WIN' || result.outcome === 'LOSS')) {
+        const emoji = result.outcome === 'WIN' ? '✅' : '❌';
+        sendTelegram(emoji + ' <b>Card #' + card.id + ' ' + result.outcome + '</b>\n\n' +
+          card.direction + ' ' + card.signal_source + '\n' +
+          '📍 Entry: $' + result.entry_price + '\n' +
+          '🎯 Current: $' + result.current_price + '\n' +
+          '📊 P&L: ' + result.pnl_pct + '%\n' +
+          result.outcome_notes);
+      }
+    } else {
+      console.log('Card #' + card.id + ' (' + card.signal_source + ') → still open · P&L: ' + result.pnl_pct + '%');
+    }
+    
+    await new Promise(r => setTimeout(r, 500));
+  }
+  
+  console.log('Outcome check done. Updates:', updates);
+  return { checked: cards.length, updates };
+}
+
+// Розклад: щоденно о 21:00 UTC (ринки US закрилися)
+function scheduleOutcomeCheck() {
+  const now = new Date();
+  const next = new Date(now);
+  next.setUTCHours(21, 0, 0, 0);
+  if (next <= now) next.setUTCDate(next.getUTCDate() + 1);
+  setTimeout(() => {
+    runOutcomeCheck();
+    setInterval(runOutcomeCheck, 24 * 3600000);
+  }, next - now);
+  console.log('Outcome check scheduled for', next.toISOString());
+}
+scheduleOutcomeCheck();
 // Розклад: запуск раз на 6 годин (4 рази на день)
 function scheduleEdgarCheck() {
   // Перший раз через 5 хвилин (щоб всі компоненти стартували)
