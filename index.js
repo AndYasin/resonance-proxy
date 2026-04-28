@@ -3493,8 +3493,11 @@ async function buildActionCard(signal) {
     ? await getRecentWikiActivity(signal.entity.wiki_title)
     : null;
   
-  // 3. Будуємо картку через Groq
-  const prompt = buildCardPrompt(signal, marketAware, wikiContext);
+  // 3. Тягнемо живу ціну з Yahoo Finance
+  const priceData = signal.ticker ? await getYahooPrice(signal.ticker) : null;
+  
+  // 4. Будуємо картку через Groq
+  const prompt = buildCardPrompt(signal, marketAware, wikiContext, priceData);
   const cardData = await groqClassify(prompt, true); // expect JSON
   
   if (!cardData || !cardData.instrument) {
@@ -3508,7 +3511,7 @@ async function buildActionCard(signal) {
     signal_source: signal.ticker || signal.title,
     what_happened: cardData.what_happened || signal.detail,
     market_aware: marketAware.aware,
-    market_signals: marketAware.summary,
+    market_signals: marketAware.summary + (priceData?.price ? ' · price: $' + priceData.price : ''),
     asymmetry: cardData.asymmetry || '',
     instrument: cardData.instrument,
     direction: cardData.direction,
@@ -3593,10 +3596,14 @@ async function getRecentWikiActivity(wikiTitle) {
 }
 
 // Промпт для Groq
-function buildCardPrompt(signal, marketAware, wikiContext) {
+function buildCardPrompt(signal, marketAware, wikiContext, priceData) {
   const wikiSummary = (wikiContext||[]).length 
     ? `Wikipedia activity: ${wikiContext.length} аномалій за тиждень, типи: ${[...new Set(wikiContext.map(w=>w.type))].join(',')}`
     : 'Wikipedia: тиша';
+  
+  const priceLine = priceData?.price 
+    ? `\nПОТОЧНА ЦІНА: $${priceData.price} (${priceData.currency})`
+    : '';
   
   return `Ти аналітик. Маєш сигнал з RESONANCE системи. Поверни ТІЛЬКИ JSON без markdown.
 
@@ -3608,7 +3615,7 @@ ${signal.direction ? 'Напрямок інсайдерів: ' + signal.directio
 ${signal.buys !== undefined ? 'Buys: ' + signal.buys + ', Sells: ' + signal.sells : ''}
 ${signal.net_value !== undefined ? 'Net value: $' + signal.net_value : ''}
 ${signal.insiders ? 'Insiders: ' + signal.insiders.join(', ') : ''}
-${signal.entity ? 'Linked entity: ' + signal.entity.wiki_title + ' (' + signal.entity.entity_type + ')' : ''}
+${signal.entity ? 'Linked entity: ' + signal.entity.wiki_title + ' (' + signal.entity.entity_type + ')' : ''}${priceLine}
 
 КОНТЕКСТ РИНКУ:
 ${marketAware.summary}
@@ -3616,23 +3623,54 @@ ${wikiSummary}
 
 ЗАВДАННЯ: Сформуй структуровану trade idea. Якщо немає чіткого asymmetric setup — поверни {"skip": true, "reason": "..."}.
 
-Інакше JSON формат:
+ВАЖЛИВО:
+- Якщо є поточна ціна — давай target/stop_loss В ДОЛАРАХ (не в %), розрахуй від поточної ціни
+- Для опцій вказуй конкретний страйк (ATM, OTM 5%, etc)
+- Для EDGAR insider signal — lead_time 60-90 днів (не менше)
+- Position size має враховувати confidence: висока conf = 1.5-2%, середня = 0.5-1%
+
+JSON формат:
 {
   "what_happened": "1 речення пояснення сигналу",
   "asymmetry": "що ринок ще не врахував — конкретно",
-  "instrument": "тікер або options ('AAPL puts 30d')",
+  "instrument": "тікер або options ('GS Jul17 920 puts')",
   "direction": "LONG | SHORT | STRADDLE | WATCH",
-  "position_size": "1-2% portfolio",
-  "lead_time_days": число,
+  "position_size": "1.5% portfolio",
+  "lead_time_days": число (60-90 для EDGAR, 21-30 для WIKI),
   "invalidation": "що спростує сигнал — конкретний event",
-  "target": "ціна або % ціль",
-  "stop_loss": "ціна або % стоп",
-  "timeframe": "14d | 30d | 60d",
+  "target": "ціна USD або %",
+  "stop_loss": "ціна USD або %",
+  "timeframe": "30d | 60d | 90d",
   "confidence": 0.0-1.0,
   "asymmetry_score": 0.0-1.0
+}`;
 }
 
-Будь обережний з confidence. Якщо WATCH — confidence < 0.5. Якщо чіткий asymmetric setup з invalidation — 0.7-0.9.`;
+// Yahoo Finance price
+async function getYahooPrice(ticker) {
+  return new Promise((resolve) => {
+    const path = '/v8/finance/chart/' + ticker + '?interval=1d&range=5d';
+    https.get({
+      hostname: 'query1.finance.yahoo.com', path,
+      headers: { 'User-Agent': 'Mozilla/5.0' }
+    }, (r) => {
+      let d = ''; r.on('data', c => d += c);
+      r.on('end', () => {
+        try {
+          const data = JSON.parse(d);
+          const meta = data.chart?.result?.[0]?.meta;
+          if (!meta) { resolve(null); return; }
+          resolve({
+            ticker,
+            price: meta.regularMarketPrice,
+            previousClose: meta.previousClose,
+            currency: meta.currency
+          });
+        } catch(e) { resolve(null); }
+      });
+    }).on('error', () => resolve(null));
+    setTimeout(() => resolve(null), 5000);
+  });
 }
 
 // Форматуємо для Telegram
