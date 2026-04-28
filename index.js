@@ -3386,7 +3386,7 @@ async function getEdgarStats(ticker) {
 
   let last30_form4 = 0, last30_8k = 0, last30_total = 0;
   let prior60_form4 = 0, prior60_8k = 0, prior60_total = 0;
-  let last30_filings = [];
+  let form4_recent = []; // окремо тримаємо Form 4 з accession
 
   for (let i = 0; i < (f.form?.length||0); i++) {
     const date = f.filingDate[i];
@@ -3394,9 +3394,15 @@ async function getEdgarStats(ticker) {
 
     if (date >= day30 && date <= today) {
       last30_total++;
-      if (form === '4') last30_form4++;
+      if (form === '4') {
+        last30_form4++;
+        form4_recent.push({
+          form, date,
+          primaryDocument: f.primaryDocument[i],
+          accessionNumber: f.accessionNumber[i]
+        });
+      }
       if (form === '8-K') last30_8k++;
-      last30_filings.push({ form, date, primaryDocument: f.primaryDocument[i] });
     } else if (date >= day90 && date < day30) {
       prior60_total++;
       if (form === '4') prior60_form4++;
@@ -3417,7 +3423,7 @@ async function getEdgarStats(ticker) {
     prior60_form4, prior60_8k, prior60_total,
     form4_ratio: Math.round(form4_ratio * 100) / 100,
     has_8k_burst: last30_8k >= 3,
-    last30_filings: last30_filings.slice(0, 10)
+    form4_recent: form4_recent.slice(0, 10)
   };
 }
 
@@ -3493,19 +3499,11 @@ async function getEdgarStatsEnhanced(ticker) {
     return { ...baseStats, direction: 'NEUTRAL', buys: 0, sells: 0, net_value: 0, insiders: [] };
   }
 
-  const form4Filings = (baseStats.last30_filings || []).filter(f => f.form === '4').slice(0, 5);
+  const form4Filings = (baseStats.form4_recent || []).slice(0, 5);
   const transactions = [];
   for (const f4 of form4Filings) {
-    if (!f4.primaryDocument) continue;
-    // Для кожного form 4 знаходимо accession з даних — потрібен повторний запит
-    const cik = baseStats.cik;
-    // Шукаємо accession в submissions
-    const sub = await secFetch('data.sec.gov', '/submissions/CIK' + cik + '.json');
-    const idx = sub?.filings?.recent?.primaryDocument?.findIndex(p => p === f4.primaryDocument);
-    if (idx === -1 || idx === undefined) continue;
-    const accession = sub.filings.recent.accessionNumber[idx];
-    
-    const parsed = await parseForm4(cik, accession, f4.primaryDocument);
+    if (!f4.accessionNumber || !f4.primaryDocument) continue;
+    const parsed = await parseForm4(baseStats.cik, f4.accessionNumber, f4.primaryDocument);
     if (parsed) transactions.push({ ...parsed, date: f4.date });
     await new Promise(r => setTimeout(r, 400));
   }
