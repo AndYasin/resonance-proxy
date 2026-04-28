@@ -3517,10 +3517,12 @@ async function getEdgarStatsEnhanced(ticker) {
     insiders.add(t.reporter);
   }
 
-  const direction = sells > buys * 2 ? 'SELL_HEAVY'
-    : buys > sells * 2 ? 'BUY_HEAVY'
-    : sells > buys ? 'NET_SELL'
-    : buys > sells ? 'NET_BUY'
+  const direction = netValue < -1000000 ? 'SELL_HEAVY'
+    : netValue > 1000000 ? 'BUY_HEAVY'
+    : sells > buys * 2 ? 'NET_SELL'
+    : buys > sells * 2 ? 'NET_BUY'
+    : netValue < 0 ? 'NET_SELL'
+    : netValue > 0 ? 'NET_BUY'
     : 'MIXED';
 
   return {
