@@ -3410,6 +3410,117 @@ async function getEdgarStats(ticker) {
 }
 
 // Daily run — перевіряємо всі tracked entities з ticker
+
+// Парсинг Form 4 XML
+async function parseForm4(cik, accession, primaryDoc) {
+  const accessionClean = accession.replace(/-/g,'');
+  const cikInt = parseInt(cik);
+  const indexPath = '/Archives/edgar/data/' + cikInt + '/' + accessionClean + '/' + accession + '-index.htm';
+  
+  const index = await new Promise((resolve) => {
+    https.get({ hostname: 'www.sec.gov', path: indexPath, headers: SEC_HEADERS }, (r) => {
+      let d = ''; r.on('data', c => d += c);
+      r.on('end', () => resolve(d));
+    }).on('error', () => resolve(''));
+    setTimeout(() => resolve(''), 8000);
+  });
+
+  const xmlMatches = [...index.matchAll(/href="\/Archives\/edgar\/data\/[^"]+\/([^"\/]+\.xml)"/g)];
+  const xmlName = xmlMatches.find(m => !m[1].includes('xslF345') && !m[1].includes('FilingSummary'))?.[1];
+  if (!xmlName) return null;
+
+  const xmlPath = '/Archives/edgar/data/' + cikInt + '/' + accessionClean + '/' + xmlName;
+  const xml = await new Promise((resolve) => {
+    https.get({ hostname: 'www.sec.gov', path: xmlPath, headers: SEC_HEADERS }, (r) => {
+      let d = ''; r.on('data', c => d += c);
+      r.on('end', () => resolve(d));
+    }).on('error', () => resolve(''));
+    setTimeout(() => resolve(''), 8000);
+  });
+
+  if (!xml) return null;
+
+  const reporter = xml.match(/<rptOwnerName>([^<]+)<\/rptOwnerName>/)?.[1] || 'Unknown';
+  const title = xml.match(/<officerTitle>([^<]+)<\/officerTitle>/)?.[1] || '';
+  const codes = [...xml.matchAll(/<transactionCode>([^<]+)<\/transactionCode>/g)].map(m => m[1]);
+  const shares = [...xml.matchAll(/<transactionShares>\s*<value>([\d.]+)<\/value>/g)].map(m => parseFloat(m[1]));
+  const prices = [...xml.matchAll(/<transactionPricePerShare>\s*<value>([\d.]+)<\/value>/g)].map(m => parseFloat(m[1]));
+  const ad = [...xml.matchAll(/<transactionAcquiredDisposedCode>\s*<value>([AD])<\/value>/g)].map(m => m[1]);
+
+  let totalBought = 0, totalSold = 0, totalValue = 0;
+  for (let i = 0; i < codes.length; i++) {
+    const code = codes[i];
+    const sh = shares[i] || 0;
+    const pr = prices[i] || 0;
+    const value = sh * pr;
+    if (code === 'P' || (ad[i] === 'A' && code !== 'M' && code !== 'F')) {
+      totalBought += sh;
+      totalValue += value;
+    } else if (code === 'S' || (ad[i] === 'D' && code !== 'M' && code !== 'F')) {
+      totalSold += sh;
+      totalValue -= value;
+    }
+  }
+
+  return {
+    reporter, title,
+    bought: totalBought,
+    sold: totalSold,
+    netValue: totalValue,
+    direction: totalSold > totalBought ? 'SELL' : totalBought > totalSold ? 'BUY' : 'NEUTRAL'
+  };
+}
+
+// Розширений stats з парсингом до 5 form 4
+async function getEdgarStatsEnhanced(ticker) {
+  const baseStats = await getEdgarStats(ticker);
+  if (!baseStats) return null;
+
+  // Парсимо тільки якщо є burst — економимо API calls
+  if (baseStats.form4_ratio < 1.5 || baseStats.last30_form4 < 3) {
+    return { ...baseStats, direction: 'NEUTRAL', buys: 0, sells: 0, net_value: 0, insiders: [] };
+  }
+
+  const form4Filings = (baseStats.last30_filings || []).filter(f => f.form === '4').slice(0, 5);
+  const transactions = [];
+  for (const f4 of form4Filings) {
+    if (!f4.primaryDocument) continue;
+    // Для кожного form 4 знаходимо accession з даних — потрібен повторний запит
+    const cik = baseStats.cik;
+    // Шукаємо accession в submissions
+    const sub = await secFetch('data.sec.gov', '/submissions/CIK' + cik + '.json');
+    const idx = sub?.filings?.recent?.primaryDocument?.findIndex(p => p === f4.primaryDocument);
+    if (idx === -1 || idx === undefined) continue;
+    const accession = sub.filings.recent.accessionNumber[idx];
+    
+    const parsed = await parseForm4(cik, accession, f4.primaryDocument);
+    if (parsed) transactions.push({ ...parsed, date: f4.date });
+    await new Promise(r => setTimeout(r, 400));
+  }
+
+  let buys = 0, sells = 0, netValue = 0;
+  const insiders = new Set();
+  for (const t of transactions) {
+    if (t.direction === 'BUY') buys++;
+    if (t.direction === 'SELL') sells++;
+    netValue += t.netValue || 0;
+    insiders.add(t.reporter);
+  }
+
+  const direction = sells > buys * 2 ? 'SELL_HEAVY'
+    : buys > sells * 2 ? 'BUY_HEAVY'
+    : sells > buys ? 'NET_SELL'
+    : buys > sells ? 'NET_BUY'
+    : 'MIXED';
+
+  return {
+    ...baseStats,
+    direction,
+    buys, sells,
+    net_value: Math.round(netValue),
+    insiders: [...insiders].slice(0, 5)
+  };
+}
 async function runDailyEdgarCheck() {
   console.log('Running daily EDGAR check...');
 
@@ -3432,7 +3543,7 @@ async function runDailyEdgarCheck() {
   let alerts = 0;
 
   for (const ticker of tickers) {
-    const stats = await getEdgarStats(ticker);
+    const stats = await getEdgarStatsEnhanced(ticker);
     if (!stats) continue;
 
     // Перший раз — записуємо baseline і пропускаємо
@@ -3450,9 +3561,10 @@ async function runDailyEdgarCheck() {
     if (isInsiderBurst) {
       // Знайти tracked entity для контексту
       const entity = tracked.find(t => t.related_ticker === ticker);
-      const detail = ticker + ' insiders ' + stats.form4_ratio + 'x activity (last 30d: ' + stats.last30_form4 + ' form4 vs prior 60d avg) · 8-K count: ' + stats.last30_8k;
+      const dirEmoji = stats.direction === 'SELL_HEAVY' ? '🔴' : stats.direction === 'BUY_HEAVY' ? '🟢' : stats.direction === 'NET_SELL' ? '📉' : stats.direction === 'NET_BUY' ? '📈' : '⚖️';
+      const detail = ticker + ' ' + dirEmoji + ' ' + (stats.direction || 'NEUTRAL') + ' · ' + stats.form4_ratio + 'x activity (' + stats.last30_form4 + ' form4 last 30d) · buys:' + (stats.buys||0) + '/sells:' + (stats.sells||0) + ' · 8-K:' + stats.last30_8k + ((stats.insiders||[]).length ? ' · ' + stats.insiders.slice(0,2).join(', ') : '');
 
-      console.log('EDGAR alert:', ticker, '|', stats.form4_ratio + 'x', '| F4:', stats.last30_form4, '| 8K:', stats.last30_8k);
+      console.log('EDGAR alert:', ticker, '|', stats.direction, '|', stats.form4_ratio + 'x', '| F4:', stats.last30_form4, '| B/S:', stats.buys+'/'+stats.sells);
 
       supabaseInsert('cross_signals', {
         type: 'EDGAR+INSIDER',
@@ -3467,13 +3579,17 @@ async function runDailyEdgarCheck() {
 
       // Telegram для strong signals
       if (isStrongSignal && TELEGRAM_TOKEN) {
+        const dirIcon = stats.direction === 'SELL_HEAVY' ? '🔴 SELL-HEAVY' : stats.direction === 'BUY_HEAVY' ? '🟢 BUY-HEAVY' : (stats.direction || 'MIXED');
         sendTelegram(
-          '📈 <b>EDGAR INSIDER BURST: ' + ticker + '</b>\n\n' +
+          '📊 <b>EDGAR INSIDER BURST: ' + ticker + '</b>\n\n' +
+          dirIcon + '\n' +
           '🎯 ' + stats.form4_ratio + 'x activity vs 60-day baseline\n' +
-          '📋 Form 4 (insider): ' + stats.last30_form4 + ' (last 30d) vs ' + stats.prior60_form4 + ' (prior 60d)\n' +
-          '📰 8-K material: ' + stats.last30_8k + (stats.has_8k_burst ? ' ⚠️ BURST' : '') + '\n' +
-          (entity ? '\n👤 Linked: ' + entity.wiki_title + '\n📊 Type: ' + entity.entity_type : '') +
-          '\n\n🔗 https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=' + stats.cik
+          '📋 Form 4: ' + stats.last30_form4 + ' (30d) vs ' + stats.prior60_form4 + ' (prior 60d)\n' +
+          '💰 Buys: ' + (stats.buys||0) + ' / Sells: ' + (stats.sells||0) + ' / Net: USD ' + Math.abs(stats.net_value||0).toLocaleString() + '\n' +
+          '📰 8-K: ' + stats.last30_8k + (stats.has_8k_burst ? ' ⚠️ BURST' : '') + '\n' +
+          ((stats.insiders||[]).length ? '👥 ' + stats.insiders.slice(0,3).join(', ') + '\n' : '') +
+          (entity ? '\n🎯 Linked: ' + entity.wiki_title + '\n' : '') +
+          '\n🔗 https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=' + stats.cik
         );
       }
     }
