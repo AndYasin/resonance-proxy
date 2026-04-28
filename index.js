@@ -1147,6 +1147,18 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // /edgar/parse?ticker=X — діагностика парсингу
+  if (req.url.startsWith('/edgar/parse')) {
+    const params = new URLSearchParams(req.url.split('?')[1]||'');
+    const ticker = params.get('ticker') || '';
+    if (!ticker) { res.writeHead(400); res.end('{}'); return; }
+    getEdgarStatsEnhanced(ticker).then(result => {
+      res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+      res.end(JSON.stringify(result, null, 2));
+    });
+    return;
+  }
+
   // /edgar/check — manual trigger
   if (req.url === '/edgar/check') {
     res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
