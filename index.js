@@ -1147,6 +1147,55 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // /cards — list pending action cards
+  if (req.url.startsWith('/cards')) {
+    const params = new URLSearchParams(req.url.split('?')[1]||'');
+    const status = params.get('status') || 'pending';
+    const url = SUPABASE_URL + '/rest/v1/action_cards?status=eq.' + status
+      + '&order=created_at.desc&limit=30';
+    https.get(url, { headers: { 'apikey': SUPABASE_KEY, 'Authorization': 'Bearer ' + SUPABASE_KEY }}, (r2) => {
+      let d = ''; r2.on('data', c => d += c);
+      r2.on('end', () => {
+        res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+        res.end(d);
+      });
+    }).on('error', () => { res.writeHead(500); res.end('[]'); });
+    return;
+  }
+
+  // /card/decide?id=X&decision=approve|reject|watch
+  if (req.url.startsWith('/card/decide')) {
+    const params = new URLSearchParams(req.url.split('?')[1]||'');
+    const id = params.get('id');
+    const decision = params.get('decision');
+    if (!id || !['approve','reject','watch'].includes(decision)) {
+      res.writeHead(400); res.end('{"error":"need id and decision"}'); return;
+    }
+    const newStatus = decision === 'approve' ? 'approved' : decision === 'reject' ? 'rejected' : 'watching';
+    const body = JSON.stringify({ status: newStatus, user_decision: decision, decision_at: new Date().toISOString() });
+    const req2 = https.request({
+      hostname: 'ovedzfpptsnxzxioyzkr.supabase.co',
+      path: '/rest/v1/action_cards?id=eq.' + id,
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+        'apikey': SUPABASE_KEY,
+        'Authorization': 'Bearer ' + SUPABASE_KEY,
+        'Prefer': 'return=minimal'
+      }
+    }, (r3) => {
+      let d = ''; r3.on('data', c => d += c);
+      r3.on('end', () => {
+        res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+        res.end(JSON.stringify({ id, decision, status: newStatus }));
+      });
+    });
+    req2.on('error', () => { res.writeHead(500); res.end('{}'); });
+    req2.write(body); req2.end();
+    return;
+  }
+
   // /edgar/parse?ticker=X — діагностика парсингу
   if (req.url.startsWith('/edgar/parse')) {
     const params = new URLSearchParams(req.url.split('?')[1]||'');
@@ -3429,6 +3478,213 @@ async function getEdgarStats(ticker) {
 
 // Daily run — перевіряємо всі tracked entities з ticker
 
+// ════════════════════════════════════════
+// ACTION CARDS — структуровані картки до дії
+// ════════════════════════════════════════
+
+async function buildActionCard(signal) {
+  // signal: {type, ticker, direction, ratio, buys, sells, net_value, insiders, entity, etc}
+  
+  // 1. Перевірка чи ринок вже знає (price + news)
+  const marketAware = await checkMarketAwareness(signal.ticker);
+  
+  // 2. Тягнемо контекст з нашої системи
+  const wikiContext = signal.entity?.wiki_title 
+    ? await getRecentWikiActivity(signal.entity.wiki_title)
+    : null;
+  
+  // 3. Будуємо картку через Groq
+  const prompt = buildCardPrompt(signal, marketAware, wikiContext);
+  const cardData = await groqClassify(prompt, true); // expect JSON
+  
+  if (!cardData || !cardData.instrument) {
+    console.log('Action card skipped — no clear trade idea');
+    return null;
+  }
+  
+  // 4. Зберігаємо
+  const card = {
+    signal_type: signal.type,
+    signal_source: signal.ticker || signal.title,
+    what_happened: cardData.what_happened || signal.detail,
+    market_aware: marketAware.aware,
+    market_signals: marketAware.summary,
+    asymmetry: cardData.asymmetry || '',
+    instrument: cardData.instrument,
+    direction: cardData.direction,
+    position_size: cardData.position_size || '1-2% portfolio',
+    lead_time_days: cardData.lead_time_days || signal.lead_time || 30,
+    invalidation: cardData.invalidation || '',
+    target: cardData.target || '',
+    stop_loss: cardData.stop_loss || '',
+    timeframe: cardData.timeframe || '30d',
+    confidence: cardData.confidence || 0.5,
+    asymmetry_score: cardData.asymmetry_score || 0.5,
+    status: 'pending'
+  };
+  
+  // Запис в Supabase
+  const insertResult = await new Promise((resolve) => {
+    const body = JSON.stringify(card);
+    const req = https.request({
+      hostname: 'ovedzfpptsnxzxioyzkr.supabase.co',
+      path: '/rest/v1/action_cards',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+        'apikey': SUPABASE_KEY,
+        'Authorization': 'Bearer ' + SUPABASE_KEY,
+        'Prefer': 'return=representation'
+      }
+    }, (r) => {
+      let d = ''; r.on('data', c => d += c);
+      r.on('end', () => { try { resolve(JSON.parse(d)); } catch(e) { resolve(null); } });
+    });
+    req.on('error', () => resolve(null));
+    req.write(body); req.end();
+  });
+  
+  const cardId = insertResult?.[0]?.id;
+  
+  // Telegram з картою якщо confidence висока
+  if (card.confidence >= 0.7 && TELEGRAM_TOKEN) {
+    sendTelegram(formatCardForTelegram(card, cardId));
+  }
+  
+  return { id: cardId, card };
+}
+
+// Перевіряємо чи ринок вже знає (price action + news count)
+async function checkMarketAwareness(ticker) {
+  if (!ticker) return { aware: false, summary: 'no ticker' };
+  
+  // Поки спрощено — без price API. Покажемо що є з cross_signals на цей тикер
+  const url = SUPABASE_URL + '/rest/v1/cross_signals?crypto_symbol=eq.' + ticker
+    + '&created_at=gte.' + new Date(Date.now() - 7*86400000).toISOString()
+    + '&limit=10';
+  
+  const recent = await new Promise((resolve) => {
+    https.get(url, { headers: { 'apikey': SUPABASE_KEY, 'Authorization': 'Bearer ' + SUPABASE_KEY }}, (r) => {
+      let d = ''; r.on('data', c => d += c);
+      r.on('end', () => { try { resolve(JSON.parse(d)); } catch(e) { resolve([]); } });
+    }).on('error', () => resolve([]));
+  });
+  
+  const recentTypes = [...new Set((recent||[]).map(r => r.type))];
+  return {
+    aware: recentTypes.includes('WIKI+POLYMARKET'),
+    summary: recentTypes.length ? recentTypes.join(', ') : 'тиша в інших джерелах'
+  };
+}
+
+// Контекст з Wikipedia за 7 днів
+async function getRecentWikiActivity(wikiTitle) {
+  const url = SUPABASE_URL + '/rest/v1/anomalies?title=eq.' + encodeURIComponent(wikiTitle)
+    + '&created_at=gte.' + new Date(Date.now() - 7*86400000).toISOString()
+    + '&limit=5';
+  
+  return new Promise((resolve) => {
+    https.get(url, { headers: { 'apikey': SUPABASE_KEY, 'Authorization': 'Bearer ' + SUPABASE_KEY }}, (r) => {
+      let d = ''; r.on('data', c => d += c);
+      r.on('end', () => { try { resolve(JSON.parse(d)); } catch(e) { resolve([]); } });
+    }).on('error', () => resolve([]));
+  });
+}
+
+// Промпт для Groq
+function buildCardPrompt(signal, marketAware, wikiContext) {
+  const wikiSummary = (wikiContext||[]).length 
+    ? `Wikipedia activity: ${wikiContext.length} аномалій за тиждень, типи: ${[...new Set(wikiContext.map(w=>w.type))].join(',')}`
+    : 'Wikipedia: тиша';
+  
+  return `Ти аналітик. Маєш сигнал з RESONANCE системи. Поверни ТІЛЬКИ JSON без markdown.
+
+СИГНАЛ:
+Тип: ${signal.type}
+Джерело: ${signal.ticker || signal.title}
+Деталі: ${signal.detail}
+${signal.direction ? 'Напрямок інсайдерів: ' + signal.direction : ''}
+${signal.buys !== undefined ? 'Buys: ' + signal.buys + ', Sells: ' + signal.sells : ''}
+${signal.net_value !== undefined ? 'Net value: $' + signal.net_value : ''}
+${signal.insiders ? 'Insiders: ' + signal.insiders.join(', ') : ''}
+${signal.entity ? 'Linked entity: ' + signal.entity.wiki_title + ' (' + signal.entity.entity_type + ')' : ''}
+
+КОНТЕКСТ РИНКУ:
+${marketAware.summary}
+${wikiSummary}
+
+ЗАВДАННЯ: Сформуй структуровану trade idea. Якщо немає чіткого asymmetric setup — поверни {"skip": true, "reason": "..."}.
+
+Інакше JSON формат:
+{
+  "what_happened": "1 речення пояснення сигналу",
+  "asymmetry": "що ринок ще не врахував — конкретно",
+  "instrument": "тікер або options ('AAPL puts 30d')",
+  "direction": "LONG | SHORT | STRADDLE | WATCH",
+  "position_size": "1-2% portfolio",
+  "lead_time_days": число,
+  "invalidation": "що спростує сигнал — конкретний event",
+  "target": "ціна або % ціль",
+  "stop_loss": "ціна або % стоп",
+  "timeframe": "14d | 30d | 60d",
+  "confidence": 0.0-1.0,
+  "asymmetry_score": 0.0-1.0
+}
+
+Будь обережний з confidence. Якщо WATCH — confidence < 0.5. Якщо чіткий asymmetric setup з invalidation — 0.7-0.9.`;
+}
+
+// Форматуємо для Telegram
+function formatCardForTelegram(card, cardId) {
+  const dirEmoji = card.direction === 'LONG' ? '🟢' : card.direction === 'SHORT' ? '🔴' : card.direction === 'STRADDLE' ? '🎯' : '👁';
+  return '🎴 <b>ACTION CARD #' + (cardId||'?') + '</b>\n\n' +
+    dirEmoji + ' <b>' + (card.direction||'WATCH') + ' ' + (card.instrument||'?') + '</b>\n\n' +
+    '<b>Що сталось:</b>\n' + (card.what_happened||'').slice(0,200) + '\n\n' +
+    '<b>Асиметрія:</b>\n' + (card.asymmetry||'').slice(0,200) + '\n\n' +
+    '⏱ Lead time: ' + (card.lead_time_days||'?') + 'd · timeframe: ' + (card.timeframe||'?') + '\n' +
+    '🎯 Target: ' + (card.target||'?') + '\n' +
+    '🛑 Stop: ' + (card.stop_loss||'?') + '\n' +
+    '❌ Invalidation: ' + (card.invalidation||'').slice(0,150) + '\n' +
+    '📊 Confidence: ' + Math.round((card.confidence||0)*100) + '% · Asymmetry: ' + Math.round((card.asymmetry_score||0)*100) + '%\n' +
+    '💼 Size: ' + (card.position_size||'?') + '\n\n' +
+    '<i>Status: pending — approve/reject в дашборді</i>';
+}
+
+// Helper для Groq classify повертаючий JSON
+async function groqClassify(prompt, expectJson) {
+  return new Promise((resolve) => {
+    if (!GROQ_API_KEY) { resolve(null); return; }
+    const body = JSON.stringify({
+      model: 'llama-3.3-70b-versatile',
+      messages: [{ role: 'user', content: prompt }],
+      temperature: 0.3,
+      max_tokens: 1500,
+      response_format: expectJson ? { type: 'json_object' } : undefined
+    });
+    const req = https.request({
+      hostname: 'api.groq.com', path: '/openai/v1/chat/completions', method: 'POST',
+      headers: {
+        'Content-Type': 'application/json', 'Authorization': 'Bearer ' + GROQ_API_KEY,
+        'Content-Length': Buffer.byteLength(body)
+      }
+    }, (r) => {
+      let d = ''; r.on('data', c => d += c);
+      r.on('end', () => {
+        try {
+          const resp = JSON.parse(d);
+          const text = resp.choices?.[0]?.message?.content || '';
+          if (expectJson) resolve(JSON.parse(text.replace(/```json|```/g,'').trim()));
+          else resolve(text);
+        } catch(e) { resolve(null); }
+      });
+    });
+    req.on('error', () => resolve(null));
+    req.write(body); req.end();
+    setTimeout(() => resolve(null), 30000);
+  });
+}
+
 // Парсинг Form 4 XML
 async function parseForm4(cik, accession, primaryDoc) {
   const accessionClean = accession.replace(/-/g,'');
@@ -3588,6 +3844,21 @@ async function runDailyEdgarCheck() {
       }, 'title,type');
 
       alerts++;
+
+      // Action Card
+      buildActionCard({
+        type: 'EDGAR+INSIDER',
+        ticker,
+        title: ticker,
+        detail,
+        direction: stats.direction,
+        buys: stats.buys,
+        sells: stats.sells,
+        net_value: stats.net_value,
+        insiders: stats.insiders,
+        entity,
+        lead_time: 60
+      }).catch(e => console.log('Card error:', e.message));
 
       // Telegram для strong signals
       if (isStrongSignal && TELEGRAM_TOKEN) {
