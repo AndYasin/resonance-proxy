@@ -1099,6 +1099,15 @@ const server = http.createServer((req, res) => {
   }
 
 
+  // /edgar/validate — pre-registered unbiased validation experiment
+  // Differs from /edgar/backtest (curated 20 events) — fetches ALL Form 4 in 4-week period
+  // Pre-registered criteria: median 60d/90d excess return < SPY-3pp, p<0.10, n>=30 best cell
+  // Takes 30-45 minutes to complete. Streams progress to logs.
+  if (req.url === '/edgar/validate') {
+    handleEdgarValidate(req, res);
+    return;
+  }
+
   // /edgar/backtest — запустити EDGAR backtest
   if (req.url === '/edgar/backtest') {
     res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
@@ -4462,4 +4471,567 @@ function findCrossSignals() {
   }
 
   return signals;
+}
+
+// ════════════════════════════════════════
+// EDGAR VALIDATION (pre-registered grid analysis)
+// Endpoint: /edgar/validate
+//
+// Pre-registered criteria (RESONANCE_handoff_brief.md):
+//   median 60d/90d excess return < SPY - 3pp, p<0.10, n>=30 best cell
+// Period: 2024-02-05 to 2024-03-01 (4 weeks)
+// Grid: N in {2,3,4} insiders × value in {$500K, $1M, $5M}
+//
+// Differs from /edgar/backtest: that one is curated 20 events (cherry-picked).
+// This is unbiased — fetches ALL Form 4 in period, detects clusters, measures forward returns.
+// ════════════════════════════════════════
+
+const SP500_CSV_URL = 'https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv';
+
+function ev_parseCsvLine(line) {
+  const out = [];
+  let cur = '';
+  let inQuote = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (c === '"') inQuote = !inQuote;
+    else if (c === ',' && !inQuote) { out.push(cur); cur = ''; }
+    else cur += c;
+  }
+  out.push(cur);
+  return out;
+}
+
+async function ev_loadSP500CIKs() {
+  return new Promise((resolve) => {
+    https.get(SP500_CSV_URL, { headers: { 'User-Agent': 'ResonanceBot/1.0' } }, (r) => {
+      let raw = ''; r.on('data', d => raw += d);
+      r.on('end', () => {
+        const lines = raw.split('\n');
+        const set = new Set();
+        for (let i = 1; i < lines.length; i++) {
+          const fields = ev_parseCsvLine(lines[i]);
+          if (fields.length < 7) continue;
+          const cik = parseInt(fields[6].trim(), 10);
+          if (Number.isFinite(cik)) set.add(cik);
+        }
+        console.log('[validate] loaded S&P 500:', set.size, 'CIKs');
+        resolve(set);
+      });
+    }).on('error', () => resolve(new Set()));
+  });
+}
+
+async function ev_httpsGetRetry(url, maxAttempts = 4) {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const result = await new Promise((resolve) => {
+      const req = https.get(url, { headers: { 'User-Agent': 'ResonanceBot/1.0 abobiy@gmail.com' } }, (r) => {
+        let chunks = [];
+        r.on('data', c => chunks.push(c));
+        r.on('end', () => {
+          if (r.statusCode >= 200 && r.statusCode < 300) {
+            resolve({ ok: true, body: Buffer.concat(chunks).toString('utf-8') });
+          } else if (r.statusCode === 404) {
+            resolve({ ok: false, code: 404 });
+          } else {
+            resolve({ ok: false, code: r.statusCode });
+          }
+        });
+      });
+      req.on('error', () => resolve({ ok: false, code: 0 }));
+      req.setTimeout(30000, () => { req.destroy(); resolve({ ok: false, code: 0 }); });
+    });
+    if (result.ok) return result.body;
+    if (result.code === 404) return null;
+    const wait = 1500 * Math.pow(2, attempt);
+    await new Promise(r => setTimeout(r, wait));
+  }
+  return null;
+}
+
+async function ev_fetchDayMetadata(date) {
+  const allHits = [];
+  let fromOffset = 0;
+  while (true) {
+    const url = 'https://efts.sec.gov/LATEST/search-index?q=&forms=4&dateRange=custom&startdt='
+      + date + '&enddt=' + date + '&from=' + fromOffset;
+    const raw = await ev_httpsGetRetry(url);
+    if (!raw) break;
+    let data;
+    try { data = JSON.parse(raw); } catch { break; }
+    const hits = data.hits && data.hits.hits ? data.hits.hits : [];
+    const total = data.hits && data.hits.total ? data.hits.total.value || 0 : 0;
+    allHits.push(...hits);
+    if (!hits.length || allHits.length >= total) break;
+    fromOffset += hits.length;
+    await new Promise(r => setTimeout(r, 200));
+  }
+  return allHits;
+}
+
+async function ev_gatherFilings(startDate, endDate, sp500Ciks) {
+  const filings = [];
+  let cur = new Date(startDate);
+  const end = new Date(endDate);
+  while (cur <= end) {
+    const dow = cur.getUTCDay();
+    if (dow >= 1 && dow <= 5) {
+      const dateStr = cur.toISOString().slice(0, 10);
+      const t0 = Date.now();
+      const hits = await ev_fetchDayMetadata(dateStr);
+      let dayMatched = 0;
+      for (const h of hits) {
+        const src = h._source || {};
+        const ciks = (src.ciks || []).map(c => parseInt(c, 10)).filter(Number.isFinite);
+        const matched = ciks.find(c => sp500Ciks.has(c));
+        if (matched) {
+          src._sp500_cik = matched;
+          filings.push(src);
+          dayMatched++;
+        }
+      }
+      console.log('[validate]', dateStr, '->', hits.length, 'all,', dayMatched, 'S&P500',
+        '(' + ((Date.now() - t0) / 1000).toFixed(1) + 's)');
+      await new Promise(r => setTimeout(r, 400));
+    }
+    cur.setUTCDate(cur.getUTCDate() + 1);
+  }
+  return filings;
+}
+
+// Form 4 XML parsing — own version (different from existing parseForm4 which expects different signature)
+async function ev_fetchAndParseForm4(filing) {
+  const adsh = filing.adsh;
+  const issuerCik = filing._sp500_cik;
+  const noDash = adsh.replace(/-/g, '');
+  const base = 'https://www.sec.gov/Archives/edgar/data/' + issuerCik + '/' + noDash;
+  const idxUrl = base + '/' + adsh + '-index.htm';
+  const html = await ev_httpsGetRetry(idxUrl);
+  if (!html) return null;
+
+  const xmlMatches = [...html.matchAll(/href="([^"]+\.xml)"/g)].map(m => m[1]);
+  let primary = xmlMatches.find(p => !p.toLowerCase().includes('xsl'));
+  if (!primary && xmlMatches.length) primary = xmlMatches[0];
+  if (!primary) return null;
+  const xmlUrl = primary.startsWith('/') ? 'https://www.sec.gov' + primary : primary;
+  const xml = await ev_httpsGetRetry(xmlUrl);
+  if (!xml) return null;
+
+  const tickerMatch = xml.match(/<issuerTradingSymbol>([^<]+)<\/issuerTradingSymbol>/);
+  if (!tickerMatch) return null;
+  const ticker = tickerMatch[1].trim();
+
+  // 10b5-1: try direct tag, fallback to footnotes
+  let aff10b5 = false;
+  const directMatch = xml.match(/<aff10b5One>([^<]+)<\/aff10b5One>/);
+  if (directMatch) {
+    aff10b5 = directMatch[1].trim().toLowerCase() === 'true' || directMatch[1].trim() === '1';
+  }
+  if (!aff10b5) {
+    const footnotes = xml.match(/<footnote[^>]*>([\s\S]*?)<\/footnote>/g) || [];
+    for (const fn of footnotes) {
+      if (/10b5-?1/i.test(fn)) { aff10b5 = true; break; }
+    }
+  }
+
+  // First insider name only (sufficient for cluster detection)
+  const ownerBlock = xml.match(/<reportingOwner>[\s\S]*?<\/reportingOwner>/);
+  let insiderName = '';
+  if (ownerBlock) {
+    const nameM = ownerBlock[0].match(/<rptOwnerName>([^<]+)<\/rptOwnerName>/);
+    if (nameM) insiderName = nameM[1].trim();
+  }
+
+  const transactions = [];
+  const txBlocks = xml.match(/<nonDerivativeTransaction>[\s\S]*?<\/nonDerivativeTransaction>/g) || [];
+  for (const block of txBlocks) {
+    const codeM = block.match(/<transactionCode>([^<]+)<\/transactionCode>/);
+    const dateM = block.match(/<transactionDate>\s*<value>([^<]+)<\/value>/);
+    const sharesM = block.match(/<transactionShares>\s*<value>([^<]+)<\/value>/);
+    const priceM = block.match(/<transactionPricePerShare>\s*<value>([^<]+)<\/value>/);
+    const adM = block.match(/<transactionAcquiredDisposedCode>\s*<value>([^<]+)<\/value>/);
+    if (!codeM || !dateM) continue;
+    const shares = parseFloat(sharesM ? sharesM[1] : '0') || 0;
+    const price = parseFloat(priceM ? priceM[1] : '0') || 0;
+    transactions.push({
+      date: dateM[1].trim(),
+      code: codeM[1].trim(),
+      shares, price,
+      value: shares * price,
+      ad: adM ? adM[1].trim() : ''
+    });
+  }
+
+  return { ticker, insider: insiderName, transactions, aff10b5One: aff10b5 };
+}
+
+async function ev_parseAllFilings(filings) {
+  const results = [];
+  let consecutiveFails = 0;
+  for (let i = 0; i < filings.length; i++) {
+    const parsed = await ev_fetchAndParseForm4(filings[i]);
+    if (parsed) {
+      parsed.adsh = filings[i].adsh;
+      parsed.file_date = filings[i].file_date;
+      parsed.issuer_cik = filings[i]._sp500_cik;
+      results.push(parsed);
+      consecutiveFails = 0;
+    } else {
+      consecutiveFails++;
+      if (consecutiveFails >= 15) {
+        console.log('[validate] 15 consecutive parse fails, sleeping 30s');
+        await new Promise(r => setTimeout(r, 30000));
+        consecutiveFails = 0;
+      }
+    }
+    if ((i + 1) % 100 === 0) {
+      console.log('[validate] parse progress:', (i + 1) + '/' + filings.length, 'parsed=' + results.length);
+    }
+    await new Promise(r => setTimeout(r, 150));
+  }
+  return results;
+}
+
+function ev_aggregateSells(parsed, excludeFlag) {
+  const byTicker = {};
+  for (const f of parsed) {
+    if (!f.ticker) continue;
+    if (excludeFlag && f.aff10b5One) continue;
+    const insider = f.insider || 'unknown';
+    for (const tx of f.transactions || []) {
+      if (tx.code === 'S' && tx.ad === 'D' && tx.value > 0) {
+        if (!byTicker[f.ticker]) byTicker[f.ticker] = [];
+        byTicker[f.ticker].push({ date: tx.date, insider, value: tx.value });
+      }
+    }
+  }
+  return byTicker;
+}
+
+function ev_detectClusters(byTicker, nMin, valueMin, windowDays) {
+  if (!windowDays) windowDays = 10;
+  const clusters = [];
+  for (const ticker of Object.keys(byTicker)) {
+    const sells = [...byTicker[ticker]].sort((a, b) => a.date.localeCompare(b.date));
+    for (let endIdx = 0; endIdx < sells.length; endIdx++) {
+      const endDate = new Date(sells[endIdx].date);
+      const winStart = new Date(endDate);
+      winStart.setDate(winStart.getDate() - windowDays);
+      const window = sells.filter(s => {
+        const d = new Date(s.date);
+        return d >= winStart && d <= endDate;
+      });
+      const insiders = new Set(window.map(s => s.insider));
+      const total = window.reduce((sum, s) => sum + s.value, 0);
+      if (insiders.size >= nMin && total >= valueMin) {
+        clusters.push({
+          ticker,
+          alert_date: sells[endIdx].date,
+          n_insiders: insiders.size,
+          total_value: total,
+          sell_count: window.length
+        });
+        break;
+      }
+    }
+  }
+  return clusters;
+}
+
+// Yahoo Finance prices via chart endpoint (more reliable than CSV download)
+async function ev_fetchYahooHistory(ticker, startMs, endMs) {
+  return new Promise((resolve) => {
+    const path = '/v8/finance/chart/' + encodeURIComponent(ticker)
+      + '?period1=' + Math.floor(startMs / 1000)
+      + '&period2=' + Math.floor(endMs / 1000)
+      + '&interval=1d';
+    https.get({
+      hostname: 'query1.finance.yahoo.com', path,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
+        'Accept': 'application/json'
+      }
+    }, (r) => {
+      let raw = ''; r.on('data', d => raw += d);
+      r.on('end', () => {
+        try {
+          const data = JSON.parse(raw);
+          const result = data.chart && data.chart.result && data.chart.result[0];
+          if (!result) { resolve(null); return; }
+          const timestamps = result.timestamp || [];
+          const closes = (result.indicators && result.indicators.quote && result.indicators.quote[0]
+            && result.indicators.quote[0].close) || [];
+          const adjcloses = (result.indicators && result.indicators.adjclose && result.indicators.adjclose[0]
+            && result.indicators.adjclose[0].adjclose) || closes;
+          const out = [];
+          for (let i = 0; i < timestamps.length; i++) {
+            const close = adjcloses[i] != null ? adjcloses[i] : closes[i];
+            if (close == null) continue;
+            const date = new Date(timestamps[i] * 1000).toISOString().slice(0, 10);
+            out.push({ date, close });
+          }
+          resolve(out);
+        } catch (e) { resolve(null); }
+      });
+    }).on('error', () => resolve(null));
+    setTimeout(() => resolve(null), 15000);
+  });
+}
+
+function ev_computeReturn(prices, alertDate, windowBd) {
+  const idx = prices.findIndex(p => p.date > alertDate);
+  if (idx < 0) return null;
+  const exitIdx = idx + windowBd;
+  if (exitIdx >= prices.length) return null;
+  const entry = prices[idx].close;
+  const exit = prices[exitIdx].close;
+  if (entry <= 0) return null;
+  return ((exit - entry) / entry) * 100;
+}
+
+async function ev_getReturnsForPairs(pairs, windowBd, spyPrices) {
+  const byTicker = {};
+  for (const [t, d] of pairs) {
+    if (!byTicker[t]) byTicker[t] = [];
+    byTicker[t].push(d);
+  }
+  const allDates = pairs.map(p => p[1]).sort();
+  const start = new Date(allDates[0]);
+  start.setDate(start.getDate() - 5);
+  const end = new Date(allDates[allDates.length - 1]);
+  end.setDate(end.getDate() + 280);
+
+  const out = new Map();
+  const tickers = Object.keys(byTicker);
+  for (let i = 0; i < tickers.length; i++) {
+    const ticker = tickers[i];
+    const prices = await ev_fetchYahooHistory(ticker, start.getTime(), end.getTime());
+    if (!prices) continue;
+    for (const d of byTicker[ticker]) {
+      const tret = ev_computeReturn(prices, d, windowBd);
+      const sret = ev_computeReturn(spyPrices, d, windowBd);
+      if (tret !== null && sret !== null) {
+        out.set(ticker + '|' + d, { ticker_ret: tret, spy_ret: sret, excess: tret - sret });
+      }
+    }
+    await new Promise(r => setTimeout(r, 120));
+    if ((i + 1) % 25 === 0) console.log('[validate] yahoo progress:', (i + 1) + '/' + tickers.length);
+  }
+  return out;
+}
+
+function ev_median(arr) {
+  if (!arr.length) return null;
+  const s = [...arr].sort((a, b) => a - b);
+  const m = Math.floor(s.length / 2);
+  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+}
+
+function ev_mean(arr) {
+  if (!arr.length) return null;
+  return arr.reduce((a, b) => a + b, 0) / arr.length;
+}
+
+function ev_normCdf(z) {
+  const t = 1 / (1 + 0.2316419 * Math.abs(z));
+  const d = 0.3989422804 * Math.exp((-z * z) / 2);
+  let p = d * t * (0.3193815 + t * (-0.3565638 + t * (1.781478 + t * (-1.821256 + t * 1.330274))));
+  if (z > 0) p = 1 - p;
+  return p;
+}
+
+function ev_mannWhitneyULess(s1, s2) {
+  if (s1.length < 5 || s2.length < 5) return null;
+  const all = [...s1.map(x => ({ v: x, g: 1 })), ...s2.map(x => ({ v: x, g: 2 }))]
+    .sort((a, b) => a.v - b.v);
+  let rank = 1;
+  for (let i = 0; i < all.length;) {
+    let j = i;
+    while (j < all.length && all[j].v === all[i].v) j++;
+    const avgRank = (rank + (rank + (j - i) - 1)) / 2;
+    for (let k = i; k < j; k++) all[k].rank = avgRank;
+    rank += j - i;
+    i = j;
+  }
+  const r1 = all.filter(x => x.g === 1).reduce((s, x) => s + x.rank, 0);
+  const n1 = s1.length, n2 = s2.length;
+  const u1 = r1 - (n1 * (n1 + 1)) / 2;
+  const mu = (n1 * n2) / 2;
+  const sigma = Math.sqrt((n1 * n2 * (n1 + n2 + 1)) / 12);
+  if (sigma === 0) return null;
+  return ev_normCdf((u1 - mu) / sigma);
+}
+
+function ev_seededRng(seed) {
+  let s = seed;
+  return () => { s = (s * 1664525 + 1013904223) % 4294967296; return s / 4294967296; };
+}
+
+// Main handler — long-running, streams progress to logs
+async function handleEdgarValidate(req, res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Content-Type', 'application/json');
+
+  const startedAt = new Date().toISOString();
+  console.log('[validate] start ' + startedAt);
+
+  try {
+    console.log('[validate] [1/5] loading S&P 500');
+    const sp500Ciks = await ev_loadSP500CIKs();
+    if (sp500Ciks.size === 0) throw new Error('S&P 500 load failed');
+
+    console.log('[validate] [2/5] gathering filings 2024-02-05..2024-03-01');
+    const filings = await ev_gatherFilings('2024-02-05', '2024-03-01', sp500Ciks);
+    console.log('[validate] total S&P500 filings:', filings.length);
+
+    console.log('[validate] [3/5] parsing XML for ' + filings.length + ' filings');
+    const parsed = await ev_parseAllFilings(filings);
+    console.log('[validate] parsed:', parsed.length);
+
+    const n10b5 = parsed.filter(p => p.aff10b5One).length;
+    console.log('[validate] with 10b5-1 flag:', n10b5,
+      '(' + (parsed.length ? (n10b5 / parsed.length * 100).toFixed(1) : '0') + '%)');
+
+    console.log('[validate] [4/5] detecting clusters');
+    const grid = [
+      { n: 2, v: 500000 }, { n: 2, v: 1000000 }, { n: 2, v: 5000000 },
+      { n: 3, v: 500000 }, { n: 3, v: 1000000 }, { n: 3, v: 5000000 },
+      { n: 4, v: 1000000 }
+    ];
+    const scenarios = [
+      { label: 'ALL', exclude10b5: false },
+      { label: 'EXCL_10B5_1', exclude10b5: true }
+    ];
+
+    const allAlertPairs = new Set();
+    const cellResults = {};
+    for (const sc of scenarios) {
+      const sells = ev_aggregateSells(parsed, sc.exclude10b5);
+      cellResults[sc.label] = { tickers_with_sells: Object.keys(sells).length, cells: {} };
+      for (const g of grid) {
+        const clusters = ev_detectClusters(sells, g.n, g.v);
+        cellResults[sc.label].cells['N' + g.n + '_$' + (g.v / 1e6) + 'M'] = clusters;
+        for (const c of clusters) allAlertPairs.add(c.ticker + '|' + c.alert_date);
+      }
+    }
+
+    // Random control: 50 random S&P 500 tickers × random dates from period
+    const rng = ev_seededRng(42);
+    const allTickers = [...new Set(parsed.map(p => p.ticker).filter(Boolean))];
+    const allFilingDates = [...new Set(filings.map(f => f.file_date))].sort();
+    const randomPairs = [];
+    if (allTickers.length && allFilingDates.length) {
+      for (let i = 0; i < 50; i++) {
+        const t = allTickers[Math.floor(rng() * allTickers.length)];
+        const d = allFilingDates[Math.floor(rng() * allFilingDates.length)];
+        randomPairs.push([t, d]);
+      }
+    }
+    const randomKeys = randomPairs.map(([t, d]) => t + '|' + d);
+    for (const k of randomKeys) allAlertPairs.add(k);
+
+    console.log('[validate] [5/5] fetching forward returns for', allAlertPairs.size, 'pairs');
+    const allPairsArr = [...allAlertPairs].map(k => k.split('|'));
+
+    const meta = {
+      started_at: startedAt,
+      finished_at: null,
+      period: '2024-02-05 to 2024-03-01',
+      filings_total: filings.length,
+      filings_parsed: parsed.length,
+      with_10b5_1_flag: n10b5,
+      sp500_size: sp500Ciks.size
+    };
+
+    // Fetch SPY once for all windows (single price history)
+    const allDatesSorted = allPairsArr.map(p => p[1]).sort();
+    const start = new Date(allDatesSorted[0]); start.setDate(start.getDate() - 5);
+    const endRange = new Date(allDatesSorted[allDatesSorted.length - 1]); endRange.setDate(endRange.getDate() + 280);
+    console.log('[validate] fetching SPY...');
+    const spyPrices = await ev_fetchYahooHistory('SPY', start.getTime(), endRange.getTime());
+    if (!spyPrices) throw new Error('SPY history fetch failed');
+
+    const windows = {};
+    // Cache ticker prices to avoid refetch across windows
+    const tickerPriceCache = {};
+    const uniqueTickers = [...new Set(allPairsArr.map(p => p[0]))];
+    console.log('[validate] fetching', uniqueTickers.length, 'ticker histories');
+    for (let i = 0; i < uniqueTickers.length; i++) {
+      const t = uniqueTickers[i];
+      const prices = await ev_fetchYahooHistory(t, start.getTime(), endRange.getTime());
+      if (prices) tickerPriceCache[t] = prices;
+      await new Promise(r => setTimeout(r, 120));
+      if ((i + 1) % 25 === 0) console.log('[validate]   yahoo:', (i + 1) + '/' + uniqueTickers.length);
+    }
+
+    for (const windowBd of [30, 60, 90, 180]) {
+      const returns = new Map();
+      for (const [ticker, alertDate] of allPairsArr) {
+        const prices = tickerPriceCache[ticker];
+        if (!prices) continue;
+        const tret = ev_computeReturn(prices, alertDate, windowBd);
+        const sret = ev_computeReturn(spyPrices, alertDate, windowBd);
+        if (tret !== null && sret !== null) {
+          returns.set(ticker + '|' + alertDate, { ticker_ret: tret, spy_ret: sret, excess: tret - sret });
+        }
+      }
+      const randExcess = randomKeys.map(k => returns.get(k)).filter(Boolean).map(r => r.excess);
+      const winResults = {
+        random_control: {
+          n: randExcess.length,
+          median: ev_median(randExcess),
+          mean: ev_mean(randExcess)
+        },
+        scenarios: {}
+      };
+      for (const sc of scenarios) {
+        winResults.scenarios[sc.label] = {};
+        for (const cellKey of Object.keys(cellResults[sc.label].cells)) {
+          const clusters = cellResults[sc.label].cells[cellKey];
+          const excesses = clusters
+            .map(c => returns.get(c.ticker + '|' + c.alert_date))
+            .filter(Boolean).map(r => r.excess);
+          let p = null;
+          if (excesses.length >= 5 && randExcess.length >= 5) {
+            p = ev_mannWhitneyULess(excesses, randExcess);
+          }
+          winResults.scenarios[sc.label][cellKey] = {
+            n_clusters: clusters.length,
+            n_with_returns: excesses.length,
+            median_excess: ev_median(excesses),
+            mean_excess: ev_mean(excesses),
+            p_value_one_tailed_less: p
+          };
+        }
+      }
+      windows[windowBd + 'bd'] = winResults;
+      console.log('[validate] window', windowBd + 'bd done');
+    }
+
+    meta.finished_at = new Date().toISOString();
+    const result = { meta, windows, random_control_size: randomPairs.length };
+    console.log('[validate] DONE');
+
+    res.statusCode = 200;
+    res.end(JSON.stringify(result, null, 2));
+
+    // Persist for later access
+    try {
+      supabaseInsert('edgar_validation_runs', {
+        started_at: startedAt,
+        finished_at: meta.finished_at,
+        filings_total: meta.filings_total,
+        filings_parsed: meta.filings_parsed,
+        with_10b5_1_flag: meta.with_10b5_1_flag,
+        result_json: result
+      });
+    } catch (e) { /* ignore — table may not exist yet */ }
+
+  } catch (err) {
+    console.log('[validate] ERROR:', err.stack || err.message);
+    if (!res.headersSent) {
+      res.statusCode = 500;
+      res.end(JSON.stringify({ error: err.message }));
+    }
+  }
 }
