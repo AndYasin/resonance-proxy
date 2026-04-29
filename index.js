@@ -1120,6 +1120,26 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // /wiki/validate — pre-registered Wikipedia Pageviews validation
+  // Hypothesis (Moat 2013): abnormal pageviews predict stock movement (SHORT direction)
+  // Same period and criteria as /edgar/validate for direct comparison
+  if (req.url === '/wiki/validate') {
+    handleWikiValidate(req, res);
+    return;
+  }
+
+  // /wiki/validate/status — current wiki validation progress
+  if (req.url === '/wiki/validate/status') {
+    handleWikiValidateStatus(req, res);
+    return;
+  }
+
+  // /wiki/validate/result — last completed wiki validation result
+  if (req.url === '/wiki/validate/result') {
+    handleWikiValidateResult(req, res);
+    return;
+  }
+
   // /edgar/backtest — запустити EDGAR backtest
   if (req.url === '/edgar/backtest') {
     res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
@@ -5197,4 +5217,469 @@ function handleEdgarValidateResult(req, res) {
   }
   res.statusCode = 200;
   res.end(JSON.stringify(ev_state.lastResult, null, 2));
+}
+
+// ════════════════════════════════════════
+// WIKIPEDIA PAGEVIEWS VALIDATION (pre-registered)
+// Endpoint: /wiki/validate
+//
+// Hypothesis (Moat et al. 2013, Scientific Reports):
+//   Abnormal pageviews for company page predict next-period stock movement.
+//   Direction: SHORT (paper found views spike before drops, not gains).
+//
+// Pre-registered criteria (RESONANCE_handoff_brief.md):
+//   median 60d/90d excess return < SPY-3pp, p<0.10, n>=30 best cell
+// Period: 2024-02-05 to 2024-03-01 (4 weeks, same as EDGAR for direct comparison)
+// Grid: ratio threshold in {2x, 3x, 5x, 10x}
+// Universe: S&P 500
+// ════════════════════════════════════════
+
+// In-memory state for wiki validation (separate from edgar)
+let wv_state = {
+  running: false,
+  startedAt: null,
+  finishedAt: null,
+  phase: 'idle',
+  progress: '',
+  lastResult: null,
+  lastError: null
+};
+
+const WV_RESULT_FILE = '/tmp/wiki_validate_last_result.json';
+const WV_PROGRESS_FILE = '/tmp/wiki_validate_progress.json';
+
+function wv_saveProgress() {
+  try {
+    fs_ev.writeFileSync(WV_PROGRESS_FILE, JSON.stringify({
+      running: wv_state.running,
+      startedAt: wv_state.startedAt,
+      finishedAt: wv_state.finishedAt,
+      phase: wv_state.phase,
+      progress: wv_state.progress
+    }));
+  } catch (e) { /* ignore */ }
+}
+
+try {
+  if (fs_ev.existsSync(WV_RESULT_FILE)) {
+    wv_state.lastResult = JSON.parse(fs_ev.readFileSync(WV_RESULT_FILE, 'utf-8'));
+    console.log('[wv] loaded previous result from disk');
+  }
+} catch (e) { /* ignore */ }
+
+// Load S&P 500 with ticker → wiki page name mapping
+async function wv_loadSP500() {
+  return new Promise((resolve) => {
+    https.get(SP500_CSV_URL, { headers: { 'User-Agent': 'ResonanceBot/1.0' } }, (r) => {
+      let raw = ''; r.on('data', d => raw += d);
+      r.on('end', () => {
+        const lines = raw.split('\n');
+        const companies = [];
+        for (let i = 1; i < lines.length; i++) {
+          const fields = ev_parseCsvLine(lines[i]);
+          if (fields.length < 7) continue;
+          const symbol = fields[0].trim();
+          const security = fields[1].trim();
+          const cik = parseInt(fields[6].trim(), 10);
+          if (symbol && security) {
+            companies.push({ ticker: symbol, name: security, cik: Number.isFinite(cik) ? cik : null });
+          }
+        }
+        console.log('[wv] loaded S&P 500:', companies.length, 'companies');
+        resolve(companies);
+      });
+    }).on('error', () => resolve([]));
+  });
+}
+
+// Wikipedia title resolution — map company name to actual wiki page
+// Strategy: try common variants, fall back to 'Security' name from S&P 500 CSV
+async function wv_resolveWikiTitle(companyName, ticker) {
+  // Common variants to try
+  const variants = [
+    companyName,
+    companyName.replace(/\s+(Inc|Corp|Corporation|Company|Ltd|Group|Holdings|Class A|Class B)\.?$/i, '').trim(),
+    companyName.replace(/\.\s*com\b/i, '.com'),
+    ticker
+  ].filter((v, i, arr) => v && arr.indexOf(v) === i);
+
+  for (const variant of variants) {
+    const found = await wv_checkWikiPage(variant);
+    if (found) return found;
+  }
+  return null;
+}
+
+async function wv_checkWikiPage(title) {
+  return new Promise((resolve) => {
+    const path = '/api/rest_v1/page/summary/' + encodeURIComponent(title.replace(/ /g, '_'));
+    https.get({
+      hostname: 'en.wikipedia.org', path,
+      headers: { 'User-Agent': 'ResonanceBot/1.0 abobiy@gmail.com' }
+    }, (r) => {
+      let raw = ''; r.on('data', d => raw += d);
+      r.on('end', () => {
+        try {
+          const data = JSON.parse(raw);
+          // disambiguation pages don't help us
+          if (data.type === 'disambiguation') { resolve(null); return; }
+          // redirect followed automatically — return resolved title
+          if (data.title) {
+            resolve(data.title);
+            return;
+          }
+          resolve(null);
+        } catch (e) { resolve(null); }
+      });
+    }).on('error', () => resolve(null));
+    setTimeout(() => resolve(null), 10000);
+  });
+}
+
+// Fetch pageviews for a wiki title for a date range
+// Returns array of {date: 'YYYYMMDD', views: N}
+async function wv_fetchPageviews(title, startDate, endDate) {
+  const fmtDate = d => d.replace(/-/g, '');
+  const startFmt = fmtDate(startDate);
+  const endFmt = fmtDate(endDate);
+  const titleEnc = encodeURIComponent(title.replace(/ /g, '_'));
+  const path = '/api/rest_v1/metrics/pageviews/per-article/en.wikipedia/all-access/all-agents/'
+    + titleEnc + '/daily/' + startFmt + '/' + endFmt;
+
+  return new Promise((resolve) => {
+    https.get({
+      hostname: 'wikimedia.org', path,
+      headers: { 'User-Agent': 'ResonanceBot/1.0 abobiy@gmail.com' }
+    }, (r) => {
+      let raw = ''; r.on('data', d => raw += d);
+      r.on('end', () => {
+        try {
+          const data = JSON.parse(raw);
+          const items = data.items || [];
+          resolve(items.map(item => ({
+            date: item.timestamp.slice(0, 8), // YYYYMMDD
+            views: item.views || 0
+          })));
+        } catch (e) { resolve([]); }
+      });
+    }).on('error', () => resolve([]));
+    setTimeout(() => resolve([]), 15000);
+  });
+}
+
+// For each company, detect days with abnormal pageviews
+// alert if views[d] / mean(views[d-30..d-1]) >= threshold
+function wv_detectAlerts(pageviewsArr, periodStart, periodEnd, threshold) {
+  // pageviewsArr: array sorted by date YYYYMMDD
+  if (pageviewsArr.length < 35) return []; // need 30+ days history
+
+  const alerts = [];
+  const startDate = periodStart.replace(/-/g, '');
+  const endDate = periodEnd.replace(/-/g, '');
+
+  for (let i = 30; i < pageviewsArr.length; i++) {
+    const today = pageviewsArr[i];
+    if (today.date < startDate || today.date > endDate) continue;
+    const baseline = pageviewsArr.slice(i - 30, i);
+    const baselineMean = baseline.reduce((s, d) => s + d.views, 0) / baseline.length;
+    if (baselineMean < 10) continue; // skip pages with too low baseline (noise)
+    const ratio = today.views / baselineMean;
+    if (ratio >= threshold) {
+      // Convert YYYYMMDD to YYYY-MM-DD
+      const dateFmt = today.date.slice(0, 4) + '-' + today.date.slice(4, 6) + '-' + today.date.slice(6, 8);
+      alerts.push({
+        date: dateFmt,
+        views: today.views,
+        baseline: Math.round(baselineMean),
+        ratio: Math.round(ratio * 100) / 100
+      });
+    }
+  }
+  return alerts;
+}
+
+// Main background worker
+async function wv_runValidation() {
+  if (wv_state.running) {
+    console.log('[wv] already running, skipping new trigger');
+    return;
+  }
+  wv_state.running = true;
+  wv_state.startedAt = new Date().toISOString();
+  wv_state.finishedAt = null;
+  wv_state.phase = 'starting';
+  wv_state.progress = '';
+  wv_state.lastError = null;
+  wv_saveProgress();
+
+  console.log('[wv] start ' + wv_state.startedAt);
+
+  try {
+    wv_state.phase = '1/4 loading S&P 500';
+    wv_saveProgress();
+    const companies = await wv_loadSP500();
+    if (!companies.length) throw new Error('S&P 500 load failed');
+
+    const periodStart = '2024-02-05';
+    const periodEnd = '2024-03-01';
+    // Need 30 days of history before periodStart for baseline
+    const fetchStart = '2024-01-05';
+    const fetchEnd = '2024-03-01';
+
+    wv_state.phase = '2/4 fetching pageviews';
+    wv_state.progress = '0/' + companies.length;
+    wv_saveProgress();
+    console.log('[wv] [2/4] fetching pageviews for', companies.length, 'companies');
+
+    // For each company: resolve wiki title, fetch pageviews
+    const companyData = []; // {ticker, wikiTitle, pageviews}
+    let resolved = 0;
+    let withData = 0;
+    for (let i = 0; i < companies.length; i++) {
+      const c = companies[i];
+      // Try ticker page first (often redirects to company page)
+      // Then company name with common cleanup
+      let wikiTitle = await wv_resolveWikiTitle(c.name, c.ticker);
+
+      if (wikiTitle) {
+        resolved++;
+        const pageviews = await wv_fetchPageviews(wikiTitle, fetchStart, fetchEnd);
+        if (pageviews.length >= 30) {
+          companyData.push({ ticker: c.ticker, wikiTitle, pageviews });
+          withData++;
+        }
+      }
+
+      if ((i + 1) % 25 === 0) {
+        wv_state.progress = (i + 1) + '/' + companies.length + ' (resolved=' + resolved + ', withdata=' + withData + ')';
+        wv_saveProgress();
+        console.log('[wv]', wv_state.progress);
+      }
+      // Wikimedia rate limit polite: ~5 req/sec
+      await new Promise(r => setTimeout(r, 200));
+    }
+
+    console.log('[wv] companies with data:', companyData.length, '/', companies.length);
+
+    wv_state.phase = '3/4 detecting alerts';
+    wv_saveProgress();
+    console.log('[wv] [3/4] detecting alerts across grid');
+
+    const grid = [2, 3, 5, 10];
+    const cellResults = {};
+    const allAlertPairs = new Set();
+
+    for (const threshold of grid) {
+      const cellKey = '' + threshold + 'x';
+      cellResults[cellKey] = [];
+      for (const c of companyData) {
+        const alerts = wv_detectAlerts(c.pageviews, periodStart, periodEnd, threshold);
+        // Take only first alert per ticker per period (avoid clustering)
+        if (alerts.length > 0) {
+          const first = alerts[0];
+          cellResults[cellKey].push({
+            ticker: c.ticker,
+            wikiTitle: c.wikiTitle,
+            alert_date: first.date,
+            ratio: first.ratio,
+            views: first.views,
+            baseline: first.baseline
+          });
+          allAlertPairs.add(c.ticker + '|' + first.date);
+        }
+      }
+      console.log('[wv] threshold', threshold + 'x:', cellResults[cellKey].length, 'alerts');
+    }
+
+    // Random control — same RNG/seed as EDGAR for consistency
+    const rng = ev_seededRng(42);
+    const allTickers = companyData.map(c => c.ticker);
+    // Use trading days in period (rough — Mon-Fri)
+    const allDates = [];
+    let cur = new Date(periodStart);
+    const endD = new Date(periodEnd);
+    while (cur <= endD) {
+      const dow = cur.getUTCDay();
+      if (dow >= 1 && dow <= 5) {
+        allDates.push(cur.toISOString().slice(0, 10));
+      }
+      cur.setUTCDate(cur.getUTCDate() + 1);
+    }
+    const randomPairs = [];
+    if (allTickers.length && allDates.length) {
+      for (let i = 0; i < 50; i++) {
+        const t = allTickers[Math.floor(rng() * allTickers.length)];
+        const d = allDates[Math.floor(rng() * allDates.length)];
+        randomPairs.push([t, d]);
+      }
+    }
+    const randomKeys = randomPairs.map(([t, d]) => t + '|' + d);
+    for (const k of randomKeys) allAlertPairs.add(k);
+
+    wv_state.phase = '4/4 fetching prices';
+    wv_saveProgress();
+    console.log('[wv] [4/4] fetching forward returns for', allAlertPairs.size, 'pairs');
+
+    const allPairsArr = [...allAlertPairs].map(k => k.split('|'));
+    const allDatesSorted = allPairsArr.map(p => p[1]).sort();
+    const start = new Date(allDatesSorted[0]); start.setDate(start.getDate() - 5);
+    const endRange = new Date(allDatesSorted[allDatesSorted.length - 1]); endRange.setDate(endRange.getDate() + 280);
+
+    const spyPrices = await ev_fetchYahooHistory('SPY', start.getTime(), endRange.getTime());
+    if (!spyPrices) throw new Error('SPY history fetch failed');
+
+    const tickerPriceCache = {};
+    const uniqueTickers = [...new Set(allPairsArr.map(p => p[0]))];
+    console.log('[wv] fetching', uniqueTickers.length, 'ticker histories');
+    for (let i = 0; i < uniqueTickers.length; i++) {
+      const t = uniqueTickers[i];
+      const prices = await ev_fetchYahooHistory(t, start.getTime(), endRange.getTime());
+      if (prices) tickerPriceCache[t] = prices;
+      await new Promise(r => setTimeout(r, 120));
+      if ((i + 1) % 25 === 0) {
+        wv_state.progress = 'yahoo: ' + (i + 1) + '/' + uniqueTickers.length;
+        wv_saveProgress();
+        console.log('[wv]', wv_state.progress);
+      }
+    }
+
+    const meta = {
+      started_at: wv_state.startedAt,
+      finished_at: null,
+      period: periodStart + ' to ' + periodEnd,
+      sp500_total: companies.length,
+      companies_with_pageviews: companyData.length,
+      thresholds_tested: grid
+    };
+
+    const windows = {};
+    for (const windowBd of [30, 60, 90, 180]) {
+      const returns = new Map();
+      for (const [ticker, alertDate] of allPairsArr) {
+        const prices = tickerPriceCache[ticker];
+        if (!prices) continue;
+        const tret = ev_computeReturn(prices, alertDate, windowBd);
+        const sret = ev_computeReturn(spyPrices, alertDate, windowBd);
+        if (tret !== null && sret !== null) {
+          returns.set(ticker + '|' + alertDate, { ticker_ret: tret, spy_ret: sret, excess: tret - sret });
+        }
+      }
+      const randExcess = randomKeys.map(k => returns.get(k)).filter(Boolean).map(r => r.excess);
+      const winResults = {
+        random_control: {
+          n: randExcess.length,
+          median: ev_median(randExcess),
+          mean: ev_mean(randExcess)
+        },
+        cells: {}
+      };
+      for (const cellKey of Object.keys(cellResults)) {
+        const alerts = cellResults[cellKey];
+        const excesses = alerts
+          .map(a => returns.get(a.ticker + '|' + a.alert_date))
+          .filter(Boolean).map(r => r.excess);
+        let p = null;
+        if (excesses.length >= 5 && randExcess.length >= 5) {
+          p = ev_mannWhitneyULess(excesses, randExcess);
+        }
+        winResults.cells[cellKey] = {
+          n_alerts: alerts.length,
+          n_with_returns: excesses.length,
+          median_excess: ev_median(excesses),
+          mean_excess: ev_mean(excesses),
+          p_value_one_tailed_less: p
+        };
+      }
+      windows[windowBd + 'bd'] = winResults;
+      console.log('[wv] window', windowBd + 'bd done');
+    }
+
+    meta.finished_at = new Date().toISOString();
+    const result = { meta, windows, random_control_size: randomPairs.length };
+    console.log('[wv] DONE');
+
+    try {
+      fs_ev.writeFileSync(WV_RESULT_FILE, JSON.stringify(result, null, 2));
+      console.log('[wv] result saved to', WV_RESULT_FILE);
+    } catch (e) { console.log('[wv] disk save failed:', e.message); }
+
+    try {
+      supabaseInsert('wiki_validation_runs', {
+        started_at: wv_state.startedAt,
+        finished_at: meta.finished_at,
+        sp500_total: meta.sp500_total,
+        companies_with_pageviews: meta.companies_with_pageviews,
+        result_json: result
+      });
+    } catch (e) { /* ignore */ }
+
+    wv_state.lastResult = result;
+    wv_state.finishedAt = meta.finished_at;
+    wv_state.phase = 'done';
+    wv_saveProgress();
+
+  } catch (err) {
+    console.log('[wv] ERROR:', err.stack || err.message);
+    wv_state.lastError = err.message;
+    wv_state.phase = 'error';
+    wv_saveProgress();
+  } finally {
+    wv_state.running = false;
+    wv_saveProgress();
+  }
+}
+
+function handleWikiValidate(req, res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Content-Type', 'application/json');
+
+  if (wv_state.running) {
+    res.statusCode = 200;
+    res.end(JSON.stringify({
+      status: 'already_running',
+      started_at: wv_state.startedAt,
+      phase: wv_state.phase,
+      progress: wv_state.progress,
+      message: 'Validation already running. Check /wiki/validate/status.'
+    }));
+    return;
+  }
+
+  wv_runValidation().catch(e => console.log('[wv] uncaught:', e.message));
+
+  res.statusCode = 202;
+  res.end(JSON.stringify({
+    status: 'started',
+    started_at: new Date().toISOString(),
+    estimated_duration_min: 50,
+    poll_status: '/wiki/validate/status',
+    poll_result: '/wiki/validate/result'
+  }));
+}
+
+function handleWikiValidateStatus(req, res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Content-Type', 'application/json');
+  res.statusCode = 200;
+  res.end(JSON.stringify({
+    running: wv_state.running,
+    started_at: wv_state.startedAt,
+    finished_at: wv_state.finishedAt,
+    phase: wv_state.phase,
+    progress: wv_state.progress,
+    last_error: wv_state.lastError,
+    has_result: !!wv_state.lastResult
+  }, null, 2));
+}
+
+function handleWikiValidateResult(req, res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Content-Type', 'application/json');
+  if (!wv_state.lastResult) {
+    res.statusCode = 404;
+    res.end(JSON.stringify({ error: 'no result yet — run /wiki/validate first and wait for completion' }));
+    return;
+  }
+  res.statusCode = 200;
+  res.end(JSON.stringify(wv_state.lastResult, null, 2));
 }
