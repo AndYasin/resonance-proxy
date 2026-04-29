@@ -1102,9 +1102,21 @@ const server = http.createServer((req, res) => {
   // /edgar/validate — pre-registered unbiased validation experiment
   // Differs from /edgar/backtest (curated 20 events) — fetches ALL Form 4 in 4-week period
   // Pre-registered criteria: median 60d/90d excess return < SPY-3pp, p<0.10, n>=30 best cell
-  // Takes 30-45 minutes to complete. Streams progress to logs.
+  // Non-blocking: returns immediately, runs in background
   if (req.url === '/edgar/validate') {
     handleEdgarValidate(req, res);
+    return;
+  }
+
+  // /edgar/validate/status — current validation progress
+  if (req.url === '/edgar/validate/status') {
+    handleEdgarValidateStatus(req, res);
+    return;
+  }
+
+  // /edgar/validate/result — last completed validation result
+  if (req.url === '/edgar/validate/result') {
+    handleEdgarValidateResult(req, res);
     return;
   }
 
@@ -4867,31 +4879,109 @@ function ev_seededRng(seed) {
   return () => { s = (s * 1664525 + 1013904223) % 4294967296; return s / 4294967296; };
 }
 
-// Main handler — long-running, streams progress to logs
-async function handleEdgarValidate(req, res) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Content-Type', 'application/json');
+// In-memory state — survives between HTTP requests, lost on restart
+let ev_state = {
+  running: false,
+  startedAt: null,
+  finishedAt: null,
+  phase: 'idle',
+  progress: '',
+  lastResult: null,
+  lastError: null
+};
 
-  const startedAt = new Date().toISOString();
-  console.log('[validate] start ' + startedAt);
+const fs_ev = require('fs');
+const EV_RESULT_FILE = '/tmp/edgar_validate_last_result.json';
+const EV_PROGRESS_FILE = '/tmp/edgar_validate_progress.json';
+
+function ev_saveProgress() {
+  try {
+    fs_ev.writeFileSync(EV_PROGRESS_FILE, JSON.stringify({
+      running: ev_state.running,
+      startedAt: ev_state.startedAt,
+      finishedAt: ev_state.finishedAt,
+      phase: ev_state.phase,
+      progress: ev_state.progress
+    }));
+  } catch (e) { /* ignore */ }
+}
+
+// Try to load last saved result on startup
+try {
+  if (fs_ev.existsSync(EV_RESULT_FILE)) {
+    ev_state.lastResult = JSON.parse(fs_ev.readFileSync(EV_RESULT_FILE, 'utf-8'));
+    console.log('[validate] loaded previous result from disk');
+  }
+} catch (e) { /* ignore */ }
+
+// Background worker — runs without holding HTTP request open
+async function ev_runValidation() {
+  if (ev_state.running) {
+    console.log('[validate] already running, skipping new trigger');
+    return;
+  }
+  ev_state.running = true;
+  ev_state.startedAt = new Date().toISOString();
+  ev_state.finishedAt = null;
+  ev_state.phase = 'starting';
+  ev_state.progress = '';
+  ev_state.lastError = null;
+  ev_saveProgress();
+
+  console.log('[validate] start ' + ev_state.startedAt);
 
   try {
+    ev_state.phase = '1/5 loading S&P 500';
+    ev_saveProgress();
     console.log('[validate] [1/5] loading S&P 500');
     const sp500Ciks = await ev_loadSP500CIKs();
     if (sp500Ciks.size === 0) throw new Error('S&P 500 load failed');
 
+    ev_state.phase = '2/5 gathering filings';
+    ev_saveProgress();
     console.log('[validate] [2/5] gathering filings 2024-02-05..2024-03-01');
     const filings = await ev_gatherFilings('2024-02-05', '2024-03-01', sp500Ciks);
     console.log('[validate] total S&P500 filings:', filings.length);
 
+    ev_state.phase = '3/5 parsing XML';
+    ev_state.progress = '0/' + filings.length;
+    ev_saveProgress();
     console.log('[validate] [3/5] parsing XML for ' + filings.length + ' filings');
-    const parsed = await ev_parseAllFilings(filings);
-    console.log('[validate] parsed:', parsed.length);
 
+    // Inline parsing with progress save
+    const parsed = [];
+    let consecutiveFails = 0;
+    for (let i = 0; i < filings.length; i++) {
+      const p = await ev_fetchAndParseForm4(filings[i]);
+      if (p) {
+        p.adsh = filings[i].adsh;
+        p.file_date = filings[i].file_date;
+        p.issuer_cik = filings[i]._sp500_cik;
+        parsed.push(p);
+        consecutiveFails = 0;
+      } else {
+        consecutiveFails++;
+        if (consecutiveFails >= 15) {
+          console.log('[validate] 15 consecutive parse fails, sleeping 30s');
+          await new Promise(r => setTimeout(r, 30000));
+          consecutiveFails = 0;
+        }
+      }
+      if ((i + 1) % 100 === 0) {
+        ev_state.progress = (i + 1) + '/' + filings.length;
+        ev_saveProgress();
+        console.log('[validate] parse progress:', ev_state.progress, 'parsed=' + parsed.length);
+      }
+      await new Promise(r => setTimeout(r, 150));
+    }
+
+    console.log('[validate] parsed:', parsed.length);
     const n10b5 = parsed.filter(p => p.aff10b5One).length;
     console.log('[validate] with 10b5-1 flag:', n10b5,
       '(' + (parsed.length ? (n10b5 / parsed.length * 100).toFixed(1) : '0') + '%)');
 
+    ev_state.phase = '4/5 detecting clusters';
+    ev_saveProgress();
     console.log('[validate] [4/5] detecting clusters');
     const grid = [
       { n: 2, v: 500000 }, { n: 2, v: 1000000 }, { n: 2, v: 5000000 },
@@ -4915,7 +5005,6 @@ async function handleEdgarValidate(req, res) {
       }
     }
 
-    // Random control: 50 random S&P 500 tickers × random dates from period
     const rng = ev_seededRng(42);
     const allTickers = [...new Set(parsed.map(p => p.ticker).filter(Boolean))];
     const allFilingDates = [...new Set(filings.map(f => f.file_date))].sort();
@@ -4930,11 +5019,13 @@ async function handleEdgarValidate(req, res) {
     const randomKeys = randomPairs.map(([t, d]) => t + '|' + d);
     for (const k of randomKeys) allAlertPairs.add(k);
 
+    ev_state.phase = '5/5 fetching prices';
+    ev_saveProgress();
     console.log('[validate] [5/5] fetching forward returns for', allAlertPairs.size, 'pairs');
     const allPairsArr = [...allAlertPairs].map(k => k.split('|'));
 
     const meta = {
-      started_at: startedAt,
+      started_at: ev_state.startedAt,
       finished_at: null,
       period: '2024-02-05 to 2024-03-01',
       filings_total: filings.length,
@@ -4943,16 +5034,14 @@ async function handleEdgarValidate(req, res) {
       sp500_size: sp500Ciks.size
     };
 
-    // Fetch SPY once for all windows (single price history)
     const allDatesSorted = allPairsArr.map(p => p[1]).sort();
     const start = new Date(allDatesSorted[0]); start.setDate(start.getDate() - 5);
     const endRange = new Date(allDatesSorted[allDatesSorted.length - 1]); endRange.setDate(endRange.getDate() + 280);
+
     console.log('[validate] fetching SPY...');
     const spyPrices = await ev_fetchYahooHistory('SPY', start.getTime(), endRange.getTime());
     if (!spyPrices) throw new Error('SPY history fetch failed');
 
-    const windows = {};
-    // Cache ticker prices to avoid refetch across windows
     const tickerPriceCache = {};
     const uniqueTickers = [...new Set(allPairsArr.map(p => p[0]))];
     console.log('[validate] fetching', uniqueTickers.length, 'ticker histories');
@@ -4961,9 +5050,14 @@ async function handleEdgarValidate(req, res) {
       const prices = await ev_fetchYahooHistory(t, start.getTime(), endRange.getTime());
       if (prices) tickerPriceCache[t] = prices;
       await new Promise(r => setTimeout(r, 120));
-      if ((i + 1) % 25 === 0) console.log('[validate]   yahoo:', (i + 1) + '/' + uniqueTickers.length);
+      if ((i + 1) % 25 === 0) {
+        ev_state.progress = 'yahoo: ' + (i + 1) + '/' + uniqueTickers.length;
+        ev_saveProgress();
+        console.log('[validate]   yahoo:', (i + 1) + '/' + uniqueTickers.length);
+      }
     }
 
+    const windows = {};
     for (const windowBd of [30, 60, 90, 180]) {
       const returns = new Map();
       for (const [ticker, alertDate] of allPairsArr) {
@@ -5012,26 +5106,95 @@ async function handleEdgarValidate(req, res) {
     const result = { meta, windows, random_control_size: randomPairs.length };
     console.log('[validate] DONE');
 
-    res.statusCode = 200;
-    res.end(JSON.stringify(result, null, 2));
+    // Persist to disk (survives client disconnect)
+    try {
+      fs_ev.writeFileSync(EV_RESULT_FILE, JSON.stringify(result, null, 2));
+      console.log('[validate] result saved to', EV_RESULT_FILE);
+    } catch (e) {
+      console.log('[validate] disk save failed:', e.message);
+    }
 
-    // Persist for later access
+    // Persist to Supabase (best effort)
     try {
       supabaseInsert('edgar_validation_runs', {
-        started_at: startedAt,
+        started_at: ev_state.startedAt,
         finished_at: meta.finished_at,
         filings_total: meta.filings_total,
         filings_parsed: meta.filings_parsed,
         with_10b5_1_flag: meta.with_10b5_1_flag,
         result_json: result
       });
-    } catch (e) { /* ignore — table may not exist yet */ }
+    } catch (e) { /* ignore */ }
+
+    ev_state.lastResult = result;
+    ev_state.finishedAt = meta.finished_at;
+    ev_state.phase = 'done';
+    ev_saveProgress();
 
   } catch (err) {
     console.log('[validate] ERROR:', err.stack || err.message);
-    if (!res.headersSent) {
-      res.statusCode = 500;
-      res.end(JSON.stringify({ error: err.message }));
-    }
+    ev_state.lastError = err.message;
+    ev_state.phase = 'error';
+    ev_saveProgress();
+  } finally {
+    ev_state.running = false;
+    ev_saveProgress();
   }
+}
+
+// HTTP handler — non-blocking, returns immediately
+function handleEdgarValidate(req, res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Content-Type', 'application/json');
+
+  if (ev_state.running) {
+    res.statusCode = 200;
+    res.end(JSON.stringify({
+      status: 'already_running',
+      started_at: ev_state.startedAt,
+      phase: ev_state.phase,
+      progress: ev_state.progress,
+      message: 'Validation already running. Check /edgar/validate/status for progress.'
+    }));
+    return;
+  }
+
+  // Fire-and-forget — don't await
+  ev_runValidation().catch(e => console.log('[validate] uncaught:', e.message));
+
+  res.statusCode = 202;
+  res.end(JSON.stringify({
+    status: 'started',
+    started_at: new Date().toISOString(),
+    estimated_duration_min: 35,
+    poll_status: '/edgar/validate/status',
+    poll_result: '/edgar/validate/result'
+  }));
+}
+
+function handleEdgarValidateStatus(req, res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Content-Type', 'application/json');
+  res.statusCode = 200;
+  res.end(JSON.stringify({
+    running: ev_state.running,
+    started_at: ev_state.startedAt,
+    finished_at: ev_state.finishedAt,
+    phase: ev_state.phase,
+    progress: ev_state.progress,
+    last_error: ev_state.lastError,
+    has_result: !!ev_state.lastResult
+  }, null, 2));
+}
+
+function handleEdgarValidateResult(req, res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Content-Type', 'application/json');
+  if (!ev_state.lastResult) {
+    res.statusCode = 404;
+    res.end(JSON.stringify({ error: 'no result yet — run /edgar/validate first and wait for completion' }));
+    return;
+  }
+  res.statusCode = 200;
+  res.end(JSON.stringify(ev_state.lastResult, null, 2));
 }
