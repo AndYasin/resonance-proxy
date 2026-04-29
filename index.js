@@ -1157,6 +1157,21 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // /cross/validate/v2 — lag-structured convergence with earnings exclusion (Experiment 4)
+  // Pre-registered: bin2 (EDGAR leads -15 to -5d) median 90d excess < -5pp, p<0.10, n>=20
+  if (req.url === '/cross/validate/v2') {
+    handleCrossValidateV2(req, res);
+    return;
+  }
+  if (req.url === '/cross/validate/v2/status') {
+    handleCrossValidateV2Status(req, res);
+    return;
+  }
+  if (req.url === '/cross/validate/v2/result') {
+    handleCrossValidateV2Result(req, res);
+    return;
+  }
+
   // /edgar/backtest — запустити EDGAR backtest
   if (req.url === '/edgar/backtest') {
     res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
@@ -6107,4 +6122,536 @@ function handleCrossValidateResult(req, res) {
   }
   res.statusCode = 200;
   res.end(JSON.stringify(cv_state.lastResult, null, 2));
+}
+
+// ════════════════════════════════════════
+// LAG-STRUCTURED CONVERGENCE VALIDATION (Experiment 4, pre-registered)
+// Endpoint: /cross/validate/v2
+//
+// Hypothesis: edge in EDGAR insider sells PRECEDING Wikipedia attention spikes
+//   by 5-15 days, NOT in synchronous convergence (which was null/tautology).
+//   Earnings windows excluded (±5 days from earnings) to remove tautology.
+//
+// Pre-registered criteria (RESONANCE_handoff_brief.md, Experiment 4):
+//   - Bin 2 (EDGAR leads -15 to -5 days): median 90d excess < SPY-5pp
+//   - p<0.10 one-tailed Mann-Whitney vs random control
+//   - n>=20 in Bin 2
+// Period: 2024-02-05 to 2024-03-29 (8 weeks, expanded from 4 for sample)
+// ════════════════════════════════════════
+
+let cv2_state = {
+  running: false,
+  startedAt: null,
+  finishedAt: null,
+  phase: 'idle',
+  progress: '',
+  lastResult: null,
+  lastError: null
+};
+
+const CV2_RESULT_FILE = '/tmp/cross_validate_v2_last_result.json';
+
+function cv2_saveProgress() {
+  try {
+    fs_ev.writeFileSync('/tmp/cross_validate_v2_progress.json', JSON.stringify({
+      running: cv2_state.running,
+      startedAt: cv2_state.startedAt,
+      finishedAt: cv2_state.finishedAt,
+      phase: cv2_state.phase,
+      progress: cv2_state.progress
+    }));
+  } catch (e) { /* ignore */ }
+}
+
+try {
+  if (fs_ev.existsSync(CV2_RESULT_FILE)) {
+    cv2_state.lastResult = JSON.parse(fs_ev.readFileSync(CV2_RESULT_FILE, 'utf-8'));
+    console.log('[cv2] loaded previous result from disk');
+  }
+} catch (e) { /* ignore */ }
+
+// Fetch earnings dates for a ticker via Yahoo Finance
+// Returns array of YYYY-MM-DD strings within period
+async function cv2_fetchEarningsDates(ticker, startDate, endDate) {
+  return new Promise((resolve) => {
+    const path = '/v10/finance/quoteSummary/' + encodeURIComponent(ticker)
+      + '?modules=earningsHistory,calendarEvents';
+    https.get({
+      hostname: 'query2.finance.yahoo.com', path,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
+        'Accept': 'application/json'
+      }
+    }, (r) => {
+      let raw = ''; r.on('data', d => raw += d);
+      r.on('end', () => {
+        try {
+          const data = JSON.parse(raw);
+          const result = data.quoteSummary && data.quoteSummary.result && data.quoteSummary.result[0];
+          if (!result) { resolve([]); return; }
+          const dates = [];
+          // earningsHistory has past quarter earnings
+          const history = result.earningsHistory && result.earningsHistory.history;
+          if (Array.isArray(history)) {
+            for (const h of history) {
+              if (h.quarter && h.quarter.fmt) dates.push(h.quarter.fmt);
+            }
+          }
+          // calendarEvents has upcoming
+          const cal = result.calendarEvents && result.calendarEvents.earnings;
+          if (cal && cal.earningsDate) {
+            for (const d of (cal.earningsDate || [])) {
+              if (d && d.fmt) dates.push(d.fmt);
+            }
+          }
+          // Filter to period
+          const filtered = dates.filter(d => d >= startDate && d <= endDate);
+          resolve(filtered);
+        } catch (e) { resolve([]); }
+      });
+    }).on('error', () => resolve([]));
+    setTimeout(() => resolve([]), 10000);
+  });
+}
+
+// Alternative — use SEC EDGAR for 8-K item 2.02 (Results of Operations) which
+// is filed on earnings announcement. More reliable than Yahoo.
+async function cv2_fetchEarningsFromSEC(cik, startDate, endDate) {
+  const sub = await secFetch('data.sec.gov', '/submissions/CIK' + String(cik).padStart(10, '0') + '.json');
+  if (!sub || !sub.filings || !sub.filings.recent) return [];
+  const f = sub.filings.recent;
+  const dates = [];
+  for (let i = 0; i < (f.form ? f.form.length : 0); i++) {
+    if (f.form[i] !== '8-K') continue;
+    const filingDate = f.filingDate[i];
+    if (filingDate < startDate || filingDate > endDate) continue;
+    // Items array — string like "2.02,9.01" — earnings have item 2.02
+    const items = f.items && f.items[i] ? f.items[i] : '';
+    if (items.includes('2.02')) {
+      dates.push(filingDate);
+    }
+  }
+  return dates;
+}
+
+// Re-detect EDGAR clusters with transaction_date preserved
+async function cv2_redetectEdgar(periodStart, periodEnd) {
+  console.log('[cv2] re-detecting EDGAR clusters');
+  cv2_state.phase = '1/5 EDGAR detection';
+  cv2_saveProgress();
+
+  const sp500Ciks = await ev_loadSP500CIKs();
+  if (sp500Ciks.size === 0) throw new Error('S&P 500 load failed');
+
+  const filings = await ev_gatherFilings(periodStart, periodEnd, sp500Ciks);
+  console.log('[cv2] EDGAR filings to parse:', filings.length);
+
+  const parsed = [];
+  let consecutiveFails = 0;
+  for (let i = 0; i < filings.length; i++) {
+    const p = await ev_fetchAndParseForm4(filings[i]);
+    if (p) {
+      p.adsh = filings[i].adsh;
+      p.file_date = filings[i].file_date;
+      p.issuer_cik = filings[i]._sp500_cik;
+      parsed.push(p);
+      consecutiveFails = 0;
+    } else {
+      consecutiveFails++;
+      if (consecutiveFails >= 15) {
+        await new Promise(r => setTimeout(r, 30000));
+        consecutiveFails = 0;
+      }
+    }
+    if ((i + 1) % 200 === 0) {
+      cv2_state.progress = 'EDGAR ' + (i + 1) + '/' + filings.length;
+      cv2_saveProgress();
+      console.log('[cv2]', cv2_state.progress);
+    }
+    await new Promise(r => setTimeout(r, 150));
+  }
+
+  // Build per-ticker SELL clusters with transaction_date (not filing_date) preserved
+  const sells = ev_aggregateSells(parsed, false);
+  const clusters = ev_detectClusters(sells, 2, 500000);
+  console.log('[cv2] EDGAR clusters:', clusters.length);
+
+  // Convert to per-ticker arrays with cik for earnings lookup
+  const byTicker = {};
+  const tickerToCik = {};
+  for (const p of parsed) {
+    if (p.ticker && p.issuer_cik && !tickerToCik[p.ticker]) {
+      tickerToCik[p.ticker] = p.issuer_cik;
+    }
+  }
+  for (const c of clusters) {
+    if (!byTicker[c.ticker]) byTicker[c.ticker] = [];
+    byTicker[c.ticker].push(c.alert_date);
+  }
+  return { byTicker, tickerToCik };
+}
+
+async function cv2_redetectWiki(periodStart, periodEnd) {
+  console.log('[cv2] re-detecting Wiki spikes');
+  cv2_state.phase = '2/5 Wiki detection';
+  cv2_saveProgress();
+
+  const companies = await wv_loadSP500();
+  if (!companies.length) throw new Error('S&P 500 load failed');
+
+  // Fetch range needs to extend before period for baseline
+  const fetchStart = (() => {
+    const d = new Date(periodStart);
+    d.setDate(d.getDate() - 31);
+    return d.toISOString().slice(0, 10);
+  })();
+
+  const byTicker = {};
+  for (let i = 0; i < companies.length; i++) {
+    const c = companies[i];
+    const wikiTitle = await wv_resolveWikiTitle(c.name, c.ticker);
+    if (!wikiTitle) {
+      await new Promise(r => setTimeout(r, 200));
+      continue;
+    }
+    const pageviews = await wv_fetchPageviews(wikiTitle, fetchStart, periodEnd);
+    if (pageviews.length >= 30) {
+      const alerts = wv_detectAlerts(pageviews, periodStart, periodEnd, 2);
+      if (alerts.length > 0) {
+        byTicker[c.ticker] = alerts.map(a => a.date);
+      }
+    }
+    if ((i + 1) % 50 === 0) {
+      cv2_state.progress = 'Wiki ' + (i + 1) + '/' + companies.length + ' (alerts: ' + Object.keys(byTicker).length + ')';
+      cv2_saveProgress();
+      console.log('[cv2]', cv2_state.progress);
+    }
+    await new Promise(r => setTimeout(r, 200));
+  }
+
+  console.log('[cv2] Wiki tickers with alerts:', Object.keys(byTicker).length);
+  return byTicker;
+}
+
+// Find ALL convergence pairs (not best-only) with lag info
+function cv2_findAllPairs(edgarByTicker, wikiByTicker, maxLagDays) {
+  const pairs = [];
+  for (const ticker of Object.keys(edgarByTicker)) {
+    if (!wikiByTicker[ticker]) continue;
+    const eDates = edgarByTicker[ticker];
+    const wDates = wikiByTicker[ticker];
+    for (const ed of eDates) {
+      for (const wd of wDates) {
+        const eMs = new Date(ed).getTime();
+        const wMs = new Date(wd).getTime();
+        const lagDays = Math.round((wMs - eMs) / 86400000); // wiki - edgar
+        if (Math.abs(lagDays) <= maxLagDays) {
+          pairs.push({
+            ticker,
+            edgar_date: ed,
+            wiki_date: wd,
+            lag_days: lagDays, // negative = EDGAR leads
+            // Alert date — for forward returns, use later of two (conservative)
+            alert_date: ed > wd ? ed : wd
+          });
+        }
+      }
+    }
+  }
+  return pairs;
+}
+
+// Apply earnings exclusion: drop pairs where alert_date is within ±N days of any earnings
+function cv2_excludeEarnings(pairs, earningsByTicker, exclusionDays) {
+  return pairs.filter(p => {
+    const earnings = earningsByTicker[p.ticker] || [];
+    if (!earnings.length) return true; // no earnings data — keep
+    const alertMs = new Date(p.alert_date).getTime();
+    for (const e of earnings) {
+      const eMs = new Date(e).getTime();
+      const diffDays = Math.abs(alertMs - eMs) / 86400000;
+      if (diffDays <= exclusionDays) return false;
+    }
+    return true;
+  });
+}
+
+function cv2_binByLag(pairs) {
+  const bins = {
+    'bin1_edgar_strong_leads': pairs.filter(p => p.lag_days < -15 && p.lag_days >= -30),
+    'bin2_edgar_leads': pairs.filter(p => p.lag_days < -5 && p.lag_days >= -15),
+    'bin3_simultaneous': pairs.filter(p => p.lag_days >= -5 && p.lag_days <= 5),
+    'bin4_wiki_leads': pairs.filter(p => p.lag_days > 5 && p.lag_days <= 15),
+    'bin5_wiki_strong_leads': pairs.filter(p => p.lag_days > 15 && p.lag_days <= 30)
+  };
+  return bins;
+}
+
+async function cv2_runValidation() {
+  if (cv2_state.running) {
+    console.log('[cv2] already running');
+    return;
+  }
+  cv2_state.running = true;
+  cv2_state.startedAt = new Date().toISOString();
+  cv2_state.finishedAt = null;
+  cv2_state.phase = 'starting';
+  cv2_state.progress = '';
+  cv2_state.lastError = null;
+  cv2_saveProgress();
+
+  console.log('[cv2] start ' + cv2_state.startedAt);
+
+  try {
+    const periodStart = '2024-02-05';
+    const periodEnd = '2024-03-29';
+    const earningsExclusionDays = 5;
+    const maxLagDays = 30;
+
+    const { byTicker: edgarByTicker, tickerToCik } = await cv2_redetectEdgar(periodStart, periodEnd);
+    const wikiByTicker = await cv2_redetectWiki(periodStart, periodEnd);
+
+    // Find all pairs (not best-only)
+    cv2_state.phase = '3/5 finding pairs and earnings';
+    cv2_saveProgress();
+    const allPairs = cv2_findAllPairs(edgarByTicker, wikiByTicker, maxLagDays);
+    console.log('[cv2] all convergence pairs (no earnings filter):', allPairs.length);
+
+    // Fetch earnings dates for each ticker that has pairs
+    const tickersWithPairs = [...new Set(allPairs.map(p => p.ticker))];
+    const earningsByTicker = {};
+    // Use SEC EDGAR for earnings (8-K item 2.02) — more reliable than Yahoo
+    // Need wide window for earnings (period ±60 days for context)
+    const earningsLookupStart = (() => {
+      const d = new Date(periodStart);
+      d.setDate(d.getDate() - 60);
+      return d.toISOString().slice(0, 10);
+    })();
+    const earningsLookupEnd = (() => {
+      const d = new Date(periodEnd);
+      d.setDate(d.getDate() + 60);
+      return d.toISOString().slice(0, 10);
+    })();
+    for (let i = 0; i < tickersWithPairs.length; i++) {
+      const t = tickersWithPairs[i];
+      const cik = tickerToCik[t];
+      if (cik) {
+        const dates = await cv2_fetchEarningsFromSEC(cik, earningsLookupStart, earningsLookupEnd);
+        earningsByTicker[t] = dates;
+      } else {
+        earningsByTicker[t] = [];
+      }
+      if ((i + 1) % 10 === 0) {
+        cv2_state.progress = 'earnings ' + (i + 1) + '/' + tickersWithPairs.length;
+        cv2_saveProgress();
+      }
+      await new Promise(r => setTimeout(r, 200));
+    }
+    console.log('[cv2] earnings dates fetched for', Object.keys(earningsByTicker).length, 'tickers');
+
+    const filteredPairs = cv2_excludeEarnings(allPairs, earningsByTicker, earningsExclusionDays);
+    console.log('[cv2] pairs after earnings exclusion (±' + earningsExclusionDays + 'd):', filteredPairs.length, 'of', allPairs.length);
+
+    const bins = cv2_binByLag(filteredPairs);
+    for (const binKey of Object.keys(bins)) {
+      console.log('[cv2]', binKey, ':', bins[binKey].length, 'events');
+    }
+
+    // Random control — same seed as previous experiments
+    const rng = ev_seededRng(42);
+    const allTickers = Object.keys(edgarByTicker);
+    const allDates = [];
+    let cur = new Date(periodStart);
+    const endD = new Date(periodEnd);
+    while (cur <= endD) {
+      const dow = cur.getUTCDay();
+      if (dow >= 1 && dow <= 5) allDates.push(cur.toISOString().slice(0, 10));
+      cur.setUTCDate(cur.getUTCDate() + 1);
+    }
+    const randomPairs = [];
+    if (allTickers.length && allDates.length) {
+      for (let i = 0; i < 50; i++) {
+        const t = allTickers[Math.floor(rng() * allTickers.length)];
+        const d = allDates[Math.floor(rng() * allDates.length)];
+        randomPairs.push([t, d]);
+      }
+    }
+    const randomKeys = randomPairs.map(([t, d]) => t + '|' + d);
+
+    // Collect all (ticker, date) pairs needing forward returns
+    const allPairsForReturns = new Set();
+    for (const p of filteredPairs) allPairsForReturns.add(p.ticker + '|' + p.alert_date);
+    for (const k of randomKeys) allPairsForReturns.add(k);
+
+    cv2_state.phase = '4/5 fetching prices';
+    cv2_saveProgress();
+    console.log('[cv2] [4/5] fetching prices for', allPairsForReturns.size, 'pairs');
+    const allPairsArr = [...allPairsForReturns].map(k => k.split('|'));
+    const allDatesSorted = allPairsArr.map(p => p[1]).sort();
+    if (allDatesSorted.length === 0) throw new Error('no pairs to compute returns for');
+    const start = new Date(allDatesSorted[0]); start.setDate(start.getDate() - 5);
+    const endRange = new Date(allDatesSorted[allDatesSorted.length - 1]); endRange.setDate(endRange.getDate() + 280);
+
+    const spyPrices = await ev_fetchYahooHistory('SPY', start.getTime(), endRange.getTime());
+    if (!spyPrices) throw new Error('SPY fetch failed');
+
+    const tickerPriceCache = {};
+    const uniqueTickers = [...new Set(allPairsArr.map(p => p[0]))];
+    for (let i = 0; i < uniqueTickers.length; i++) {
+      const prices = await ev_fetchYahooHistory(uniqueTickers[i], start.getTime(), endRange.getTime());
+      if (prices) tickerPriceCache[uniqueTickers[i]] = prices;
+      await new Promise(r => setTimeout(r, 120));
+    }
+
+    cv2_state.phase = '5/5 computing stats';
+    cv2_saveProgress();
+
+    // Compute returns for each window, per bin
+    const windows = {};
+    for (const windowBd of [30, 60, 90, 180]) {
+      const returns = new Map();
+      for (const [ticker, alertDate] of allPairsArr) {
+        const prices = tickerPriceCache[ticker];
+        if (!prices) continue;
+        const tret = ev_computeReturn(prices, alertDate, windowBd);
+        const sret = ev_computeReturn(spyPrices, alertDate, windowBd);
+        if (tret !== null && sret !== null) {
+          returns.set(ticker + '|' + alertDate, { ticker_ret: tret, spy_ret: sret, excess: tret - sret });
+        }
+      }
+      const randExcess = randomKeys.map(k => returns.get(k)).filter(Boolean).map(r => r.excess);
+
+      const winResults = {
+        random_control: {
+          n: randExcess.length,
+          median: ev_median(randExcess),
+          mean: ev_mean(randExcess)
+        },
+        bins: {}
+      };
+
+      for (const binKey of Object.keys(bins)) {
+        const binPairs = bins[binKey];
+        const excesses = binPairs
+          .map(p => returns.get(p.ticker + '|' + p.alert_date))
+          .filter(Boolean).map(r => r.excess);
+        let p = null;
+        if (excesses.length >= 5 && randExcess.length >= 5) {
+          p = ev_mannWhitneyULess(excesses, randExcess);
+        }
+        winResults.bins[binKey] = {
+          n: binPairs.length,
+          n_with_returns: excesses.length,
+          median_excess: ev_median(excesses),
+          mean_excess: ev_mean(excesses),
+          p_value_one_tailed_less: p
+        };
+      }
+      windows[windowBd + 'bd'] = winResults;
+      console.log('[cv2] window', windowBd + 'bd: bin2 (EDGAR leads):',
+        ev_median(bins.bin2_edgar_leads.map(p => returns.get(p.ticker + '|' + p.alert_date)).filter(Boolean).map(r => r.excess)));
+    }
+
+    const meta = {
+      started_at: cv2_state.startedAt,
+      finished_at: new Date().toISOString(),
+      period: periodStart + ' to ' + periodEnd,
+      earnings_exclusion_days: earningsExclusionDays,
+      max_lag_days: maxLagDays,
+      edgar_threshold: 'N>=2, $500K, 10d window',
+      wiki_threshold: '2x ratio',
+      edgar_tickers: Object.keys(edgarByTicker).length,
+      wiki_tickers: Object.keys(wikiByTicker).length,
+      all_pairs_before_earnings_filter: allPairs.length,
+      pairs_after_earnings_filter: filteredPairs.length,
+      tickers_with_earnings_data: Object.keys(earningsByTicker).filter(t => earningsByTicker[t].length > 0).length,
+      pre_registered_criterion: 'bin2_edgar_leads (-15 to -5d): median 90d excess < -5pp, p<0.10, n>=20'
+    };
+
+    const result = {
+      meta,
+      windows,
+      bins_detail: {
+        bin1_edgar_strong_leads: bins.bin1_edgar_strong_leads,
+        bin2_edgar_leads: bins.bin2_edgar_leads,
+        bin3_simultaneous: bins.bin3_simultaneous,
+        bin4_wiki_leads: bins.bin4_wiki_leads,
+        bin5_wiki_strong_leads: bins.bin5_wiki_strong_leads
+      },
+      excluded_earnings_pairs: allPairs.filter(p => !filteredPairs.some(fp =>
+        fp.ticker === p.ticker && fp.alert_date === p.alert_date && fp.lag_days === p.lag_days
+      )).slice(0, 30), // first 30 for inspection
+      random_control_size: randomPairs.length
+    };
+
+    console.log('[cv2] DONE');
+    try { fs_ev.writeFileSync(CV2_RESULT_FILE, JSON.stringify(result, null, 2)); }
+    catch (e) { console.log('[cv2] disk save failed:', e.message); }
+
+    cv2_state.lastResult = result;
+    cv2_state.finishedAt = meta.finished_at;
+    cv2_state.phase = 'done';
+    cv2_saveProgress();
+
+  } catch (err) {
+    console.log('[cv2] ERROR:', err.stack || err.message);
+    cv2_state.lastError = err.message;
+    cv2_state.phase = 'error';
+    cv2_saveProgress();
+  } finally {
+    cv2_state.running = false;
+    cv2_saveProgress();
+  }
+}
+
+function handleCrossValidateV2(req, res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Content-Type', 'application/json');
+  if (cv2_state.running) {
+    res.statusCode = 200;
+    res.end(JSON.stringify({
+      status: 'already_running',
+      started_at: cv2_state.startedAt,
+      phase: cv2_state.phase,
+      progress: cv2_state.progress
+    }));
+    return;
+  }
+  cv2_runValidation().catch(e => console.log('[cv2] uncaught:', e.message));
+  res.statusCode = 202;
+  res.end(JSON.stringify({
+    status: 'started',
+    started_at: new Date().toISOString(),
+    estimated_duration_min: 120,
+    note: 'Lag-structured convergence with earnings exclusion. Re-runs EDGAR+Wiki+earnings.',
+    poll_status: '/cross/validate/v2/status',
+    poll_result: '/cross/validate/v2/result'
+  }));
+}
+
+function handleCrossValidateV2Status(req, res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Content-Type', 'application/json');
+  res.statusCode = 200;
+  res.end(JSON.stringify({
+    running: cv2_state.running,
+    started_at: cv2_state.startedAt,
+    finished_at: cv2_state.finishedAt,
+    phase: cv2_state.phase,
+    progress: cv2_state.progress,
+    last_error: cv2_state.lastError,
+    has_result: !!cv2_state.lastResult
+  }, null, 2));
+}
+
+function handleCrossValidateV2Result(req, res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Content-Type', 'application/json');
+  if (!cv2_state.lastResult) {
+    res.statusCode = 404;
+    res.end(JSON.stringify({ error: 'no result yet' }));
+    return;
+  }
+  res.statusCode = 200;
+  res.end(JSON.stringify(cv2_state.lastResult, null, 2));
 }
