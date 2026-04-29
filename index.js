@@ -1140,6 +1140,23 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // /cross/validate — convergence test (EDGAR + Wiki within ±7 days)
+  // Direct test of RESONANCE concept: edge in intersection, not single signals
+  if (req.url === '/cross/validate') {
+    handleCrossValidate(req, res);
+    return;
+  }
+
+  if (req.url === '/cross/validate/status') {
+    handleCrossValidateStatus(req, res);
+    return;
+  }
+
+  if (req.url === '/cross/validate/result') {
+    handleCrossValidateResult(req, res);
+    return;
+  }
+
   // /edgar/backtest — запустити EDGAR backtest
   if (req.url === '/edgar/backtest') {
     res.writeHead(200, {'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
@@ -5682,4 +5699,412 @@ function handleWikiValidateResult(req, res) {
   }
   res.statusCode = 200;
   res.end(JSON.stringify(wv_state.lastResult, null, 2));
+}
+
+// ════════════════════════════════════════
+// CONVERGENCE VALIDATION (pre-registered)
+// Endpoint: /cross/validate
+//
+// Hypothesis: edge in intersection — companies where BOTH EDGAR insider cluster
+//   AND Wiki pageviews spike fire within ±7 days for the same ticker.
+//   Direct test of RESONANCE convergence concept.
+//
+// Pre-requisites: /edgar/validate AND /wiki/validate both must have completed.
+//   Reads ev_state.lastResult and wv_state.lastResult from memory/disk.
+//
+// Pre-registered criteria (RESONANCE_handoff_brief.md):
+//   median 60d/90d excess return < SPY-3pp, p<0.10, n>=30 best cell
+// Period: 2024-02-05 to 2024-03-01 (same as EDGAR + Wiki)
+// Convergence window: ±7 days
+// ════════════════════════════════════════
+
+let cv_state = {
+  running: false,
+  startedAt: null,
+  finishedAt: null,
+  phase: 'idle',
+  progress: '',
+  lastResult: null,
+  lastError: null
+};
+
+const CV_RESULT_FILE = '/tmp/cross_validate_last_result.json';
+
+function cv_saveProgress() {
+  try {
+    fs_ev.writeFileSync('/tmp/cross_validate_progress.json', JSON.stringify({
+      running: cv_state.running,
+      startedAt: cv_state.startedAt,
+      finishedAt: cv_state.finishedAt,
+      phase: cv_state.phase,
+      progress: cv_state.progress
+    }));
+  } catch (e) { /* ignore */ }
+}
+
+try {
+  if (fs_ev.existsSync(CV_RESULT_FILE)) {
+    cv_state.lastResult = JSON.parse(fs_ev.readFileSync(CV_RESULT_FILE, 'utf-8'));
+    console.log('[cv] loaded previous result from disk');
+  }
+} catch (e) { /* ignore */ }
+
+// Extract all EDGAR alerts from lastResult (across all cells, all scenarios)
+// Returns: Map ticker -> [{date, source: 'edgar'}]
+function cv_extractEdgarAlerts() {
+  if (!ev_state.lastResult) return null;
+  // ev_state.lastResult.windows.30bd.scenarios.ALL.cells.{cell}.{n_clusters, n_with_returns, ...}
+  // The actual cluster details are NOT in lastResult — we only have aggregates.
+  // We need raw clusters. Solution: re-run the cluster detection on the same parsed data.
+  // BUT parsed data is also not in lastResult.
+  //
+  // Alternative: use the broadest cell N2_$0.5M as proxy for "any EDGAR alert"
+  // — this gives us per-ticker alert info IF we re-detect.
+  //
+  // Workaround: re-run validation logic to re-extract clusters.
+  // This is heavy but clean.
+  return null; // signal that we need fresh re-detection
+}
+
+// Re-fetch and re-detect EDGAR clusters (lightweight version — just to get tickers+dates)
+async function cv_redetectEdgar() {
+  console.log('[cv] re-detecting EDGAR clusters from scratch (no cached raw data)');
+  cv_state.phase = '1/4 re-detecting EDGAR clusters';
+  cv_saveProgress();
+
+  const sp500Ciks = await ev_loadSP500CIKs();
+  if (sp500Ciks.size === 0) throw new Error('S&P 500 load failed');
+
+  const filings = await ev_gatherFilings('2024-02-05', '2024-03-01', sp500Ciks);
+  console.log('[cv] EDGAR filings to parse:', filings.length);
+
+  const parsed = [];
+  let consecutiveFails = 0;
+  for (let i = 0; i < filings.length; i++) {
+    const p = await ev_fetchAndParseForm4(filings[i]);
+    if (p) {
+      p.adsh = filings[i].adsh;
+      p.file_date = filings[i].file_date;
+      p.issuer_cik = filings[i]._sp500_cik;
+      parsed.push(p);
+      consecutiveFails = 0;
+    } else {
+      consecutiveFails++;
+      if (consecutiveFails >= 15) {
+        console.log('[cv] EDGAR 15 consecutive fails, sleep 30s');
+        await new Promise(r => setTimeout(r, 30000));
+        consecutiveFails = 0;
+      }
+    }
+    if ((i + 1) % 200 === 0) {
+      cv_state.progress = 'EDGAR parse ' + (i + 1) + '/' + filings.length;
+      cv_saveProgress();
+      console.log('[cv]', cv_state.progress);
+    }
+    await new Promise(r => setTimeout(r, 150));
+  }
+
+  // Aggregate EDGAR alerts: ANY cluster where N>=2 insiders sold $500K+ within 10d window
+  // (broadest threshold from grid — gives most alerts to intersect with Wiki)
+  const sells = ev_aggregateSells(parsed, false); // ALL scenario (not excluding 10b5-1)
+  const clusters = ev_detectClusters(sells, 2, 500000);
+  console.log('[cv] EDGAR clusters at N>=2,$500K:', clusters.length);
+
+  // Per-ticker: list of alert dates
+  const byTicker = {};
+  for (const c of clusters) {
+    if (!byTicker[c.ticker]) byTicker[c.ticker] = [];
+    byTicker[c.ticker].push(c.alert_date);
+  }
+  return byTicker;
+}
+
+// Re-fetch Wiki pageview alerts (lightweight — just per-ticker alert dates)
+async function cv_redetectWiki() {
+  console.log('[cv] re-detecting Wiki Pageviews alerts');
+  cv_state.phase = '2/4 re-detecting Wiki spikes';
+  cv_saveProgress();
+
+  const companies = await wv_loadSP500();
+  if (!companies.length) throw new Error('S&P 500 load failed');
+
+  const periodStart = '2024-02-05';
+  const periodEnd = '2024-03-01';
+  const fetchStart = '2024-01-05';
+  const fetchEnd = '2024-03-01';
+
+  const byTicker = {};
+  for (let i = 0; i < companies.length; i++) {
+    const c = companies[i];
+    const wikiTitle = await wv_resolveWikiTitle(c.name, c.ticker);
+    if (!wikiTitle) {
+      await new Promise(r => setTimeout(r, 200));
+      continue;
+    }
+    const pageviews = await wv_fetchPageviews(wikiTitle, fetchStart, fetchEnd);
+    if (pageviews.length >= 30) {
+      // Use threshold 2x — broadest, gives most candidates for intersection
+      const alerts = wv_detectAlerts(pageviews, periodStart, periodEnd, 2);
+      if (alerts.length > 0) {
+        byTicker[c.ticker] = alerts.map(a => a.date);
+      }
+    }
+    if ((i + 1) % 50 === 0) {
+      cv_state.progress = 'Wiki ' + (i + 1) + '/' + companies.length + ' (alerts so far: ' + Object.keys(byTicker).length + ')';
+      cv_saveProgress();
+      console.log('[cv]', cv_state.progress);
+    }
+    await new Promise(r => setTimeout(r, 200));
+  }
+
+  console.log('[cv] Wiki tickers with alerts:', Object.keys(byTicker).length);
+  return byTicker;
+}
+
+// Find convergence: ticker has BOTH edgar alert AND wiki alert within ±7 days
+function cv_findConvergence(edgarByTicker, wikiByTicker) {
+  const convergences = [];
+  for (const ticker of Object.keys(edgarByTicker)) {
+    if (!wikiByTicker[ticker]) continue;
+    const eDates = edgarByTicker[ticker];
+    const wDates = wikiByTicker[ticker];
+
+    // Find any pair within 7 days
+    let bestPair = null;
+    let smallestDiff = Infinity;
+    for (const ed of eDates) {
+      const eMs = new Date(ed).getTime();
+      for (const wd of wDates) {
+        const wMs = new Date(wd).getTime();
+        const diffDays = Math.abs(eMs - wMs) / 86400000;
+        if (diffDays <= 7 && diffDays < smallestDiff) {
+          smallestDiff = diffDays;
+          // Alert date = LATER of the two (more conservative for forward-looking returns)
+          bestPair = {
+            edgar_date: ed,
+            wiki_date: wd,
+            alert_date: ed > wd ? ed : wd,
+            days_apart: Math.round(diffDays)
+          };
+        }
+      }
+    }
+    if (bestPair) {
+      convergences.push({ ticker, ...bestPair });
+    }
+  }
+  return convergences;
+}
+
+async function cv_runValidation() {
+  if (cv_state.running) {
+    console.log('[cv] already running');
+    return;
+  }
+  cv_state.running = true;
+  cv_state.startedAt = new Date().toISOString();
+  cv_state.finishedAt = null;
+  cv_state.phase = 'starting';
+  cv_state.progress = '';
+  cv_state.lastError = null;
+  cv_saveProgress();
+
+  console.log('[cv] start ' + cv_state.startedAt);
+
+  try {
+    // Re-detect EDGAR and Wiki alerts (since raw data not preserved in summary results)
+    const edgarByTicker = await cv_redetectEdgar();
+    const wikiByTicker = await cv_redetectWiki();
+
+    cv_state.phase = '3/4 finding convergence';
+    cv_saveProgress();
+    const convergences = cv_findConvergence(edgarByTicker, wikiByTicker);
+    console.log('[cv] convergence events found:', convergences.length);
+
+    // Random control — same seed
+    const rng = ev_seededRng(42);
+    const allTickers = Object.keys(edgarByTicker); // Use EDGAR universe (any ticker that had insider sells)
+    const allDates = [];
+    let cur = new Date('2024-02-05');
+    const endD = new Date('2024-03-01');
+    while (cur <= endD) {
+      const dow = cur.getUTCDay();
+      if (dow >= 1 && dow <= 5) allDates.push(cur.toISOString().slice(0, 10));
+      cur.setUTCDate(cur.getUTCDate() + 1);
+    }
+    const randomPairs = [];
+    if (allTickers.length && allDates.length) {
+      for (let i = 0; i < 50; i++) {
+        const t = allTickers[Math.floor(rng() * allTickers.length)];
+        const d = allDates[Math.floor(rng() * allDates.length)];
+        randomPairs.push([t, d]);
+      }
+    }
+    const randomKeys = randomPairs.map(([t, d]) => t + '|' + d);
+
+    const allPairs = new Set();
+    for (const c of convergences) allPairs.add(c.ticker + '|' + c.alert_date);
+    for (const k of randomKeys) allPairs.add(k);
+
+    cv_state.phase = '4/4 fetching prices';
+    cv_saveProgress();
+    console.log('[cv] [4/4] fetching forward returns for', allPairs.size, 'pairs');
+    const allPairsArr = [...allPairs].map(k => k.split('|'));
+
+    const allDatesSorted = allPairsArr.map(p => p[1]).sort();
+    const start = new Date(allDatesSorted[0]); start.setDate(start.getDate() - 5);
+    const endRange = new Date(allDatesSorted[allDatesSorted.length - 1]); endRange.setDate(endRange.getDate() + 280);
+
+    const spyPrices = await ev_fetchYahooHistory('SPY', start.getTime(), endRange.getTime());
+    if (!spyPrices) throw new Error('SPY fetch failed');
+
+    const tickerPriceCache = {};
+    const uniqueTickers = [...new Set(allPairsArr.map(p => p[0]))];
+    for (let i = 0; i < uniqueTickers.length; i++) {
+      const prices = await ev_fetchYahooHistory(uniqueTickers[i], start.getTime(), endRange.getTime());
+      if (prices) tickerPriceCache[uniqueTickers[i]] = prices;
+      await new Promise(r => setTimeout(r, 120));
+    }
+
+    const meta = {
+      started_at: cv_state.startedAt,
+      finished_at: null,
+      period: '2024-02-05 to 2024-03-01',
+      convergence_window_days: 7,
+      edgar_threshold: 'N>=2, $500K, 10d window (broadest)',
+      wiki_threshold: '2x ratio (broadest)',
+      edgar_tickers_with_alerts: Object.keys(edgarByTicker).length,
+      wiki_tickers_with_alerts: Object.keys(wikiByTicker).length,
+      convergence_count: convergences.length
+    };
+
+    const windows = {};
+    for (const windowBd of [30, 60, 90, 180]) {
+      const returns = new Map();
+      for (const [ticker, alertDate] of allPairsArr) {
+        const prices = tickerPriceCache[ticker];
+        if (!prices) continue;
+        const tret = ev_computeReturn(prices, alertDate, windowBd);
+        const sret = ev_computeReturn(spyPrices, alertDate, windowBd);
+        if (tret !== null && sret !== null) {
+          returns.set(ticker + '|' + alertDate, { ticker_ret: tret, spy_ret: sret, excess: tret - sret });
+        }
+      }
+      const convExcess = convergences
+        .map(c => returns.get(c.ticker + '|' + c.alert_date))
+        .filter(Boolean).map(r => r.excess);
+      const randExcess = randomKeys.map(k => returns.get(k)).filter(Boolean).map(r => r.excess);
+
+      let p = null;
+      if (convExcess.length >= 5 && randExcess.length >= 5) {
+        p = ev_mannWhitneyULess(convExcess, randExcess);
+      }
+      windows[windowBd + 'bd'] = {
+        random_control: {
+          n: randExcess.length,
+          median: ev_median(randExcess),
+          mean: ev_mean(randExcess)
+        },
+        convergence: {
+          n: convergences.length,
+          n_with_returns: convExcess.length,
+          median_excess: ev_median(convExcess),
+          mean_excess: ev_mean(convExcess),
+          p_value_one_tailed_less: p
+        }
+      };
+      console.log('[cv] window', windowBd + 'bd: median=' + (ev_median(convExcess) !== null ? ev_median(convExcess).toFixed(2) : 'null') + ', p=' + (p !== null ? p.toFixed(3) : 'null'));
+    }
+
+    meta.finished_at = new Date().toISOString();
+    const result = {
+      meta,
+      windows,
+      convergence_events: convergences,
+      random_control_size: randomPairs.length
+    };
+    console.log('[cv] DONE');
+
+    try {
+      fs_ev.writeFileSync(CV_RESULT_FILE, JSON.stringify(result, null, 2));
+    } catch (e) { console.log('[cv] disk save failed:', e.message); }
+
+    try {
+      supabaseInsert('cross_validation_runs', {
+        started_at: cv_state.startedAt,
+        finished_at: meta.finished_at,
+        convergence_count: convergences.length,
+        result_json: result
+      });
+    } catch (e) { /* ignore */ }
+
+    cv_state.lastResult = result;
+    cv_state.finishedAt = meta.finished_at;
+    cv_state.phase = 'done';
+    cv_saveProgress();
+
+  } catch (err) {
+    console.log('[cv] ERROR:', err.stack || err.message);
+    cv_state.lastError = err.message;
+    cv_state.phase = 'error';
+    cv_saveProgress();
+  } finally {
+    cv_state.running = false;
+    cv_saveProgress();
+  }
+}
+
+function handleCrossValidate(req, res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Content-Type', 'application/json');
+
+  if (cv_state.running) {
+    res.statusCode = 200;
+    res.end(JSON.stringify({
+      status: 'already_running',
+      started_at: cv_state.startedAt,
+      phase: cv_state.phase,
+      progress: cv_state.progress
+    }));
+    return;
+  }
+
+  cv_runValidation().catch(e => console.log('[cv] uncaught:', e.message));
+
+  res.statusCode = 202;
+  res.end(JSON.stringify({
+    status: 'started',
+    started_at: new Date().toISOString(),
+    estimated_duration_min: 90,
+    note: 'Re-runs both EDGAR and Wiki detection from scratch. Long.',
+    poll_status: '/cross/validate/status',
+    poll_result: '/cross/validate/result'
+  }));
+}
+
+function handleCrossValidateStatus(req, res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Content-Type', 'application/json');
+  res.statusCode = 200;
+  res.end(JSON.stringify({
+    running: cv_state.running,
+    started_at: cv_state.startedAt,
+    finished_at: cv_state.finishedAt,
+    phase: cv_state.phase,
+    progress: cv_state.progress,
+    last_error: cv_state.lastError,
+    has_result: !!cv_state.lastResult
+  }, null, 2));
+}
+
+function handleCrossValidateResult(req, res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Content-Type', 'application/json');
+  if (!cv_state.lastResult) {
+    res.statusCode = 404;
+    res.end(JSON.stringify({ error: 'no result yet — run /cross/validate first' }));
+    return;
+  }
+  res.statusCode = 200;
+  res.end(JSON.stringify(cv_state.lastResult, null, 2));
 }
